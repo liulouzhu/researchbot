@@ -111,7 +111,7 @@ researchbot paper review "大语言模型安全"
 researchbot gateway
 
 # 指定端口
-researchbot gateway --port 18790
+researchbot gateway --port 18799
 
 # 指定工作目录
 researchbot gateway --workspace /path/to/workspace

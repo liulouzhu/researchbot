@@ -31,7 +31,7 @@ class ChannelsConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
-    workspace: str = "~/.nanobot/workspace"
+    workspace: str = "~/.researchbot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -100,7 +100,7 @@ class ApiConfig(Base):
     """OpenAI-compatible API server configuration."""
 
     host: str = "127.0.0.1"  # Safer default: local-only bind.
-    port: int = 8900
+    port: int = 8901
     timeout: float = 120.0  # Per-request timeout in seconds.
 
 
@@ -108,7 +108,7 @@ class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
-    port: int = 18790
+    port: int = 18799
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
