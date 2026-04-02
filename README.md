@@ -141,25 +141,11 @@ researchbot/
 | `RESEARCHBOT_CONFIG` | 配置文件路径 | `~/.researchbot/config.json` |
 | `RESEARCHBOT_MAX_CONCURRENT_REQUESTS` | 最大并发请求数 | `3` |
 
-旧版 `NANOBOT_*` 环境变量仍然兼容。
 
 ## 配置文件路径
 
 - 新版配置: `~/.researchbot/config.json`
-- 旧版配置: `~/.nanobot/config.json` (首次运行会自动迁移)
 
-## 开发
-
-```bash
-# 运行测试
-pytest tests/
-
-# 代码格式化
-ruff format .
-
-# 类型检查
-mypy researchbot/
-```
 
 ## 致谢
 
