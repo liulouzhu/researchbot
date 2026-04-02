@@ -104,20 +104,14 @@ include = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["researchbot", "nanobot"]
+packages = ["researchbot"]
 
 [tool.hatch.build.targets.wheel.sources]
 "researchbot" = "researchbot"
-"nanobot" = "nanobot"
-
-[tool.hatch.build.targets.wheel.force-include]
-"bridge" = "researchbot/bridge"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "researchbot/",
-    "nanobot/",
-    "bridge/",
     "README.md",
     "LICENSE",
 ]
