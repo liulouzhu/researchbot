@@ -33,10 +33,10 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/HKUDS/researchbot.git
+git clone https://github.com/liulouzhu/researchbot.git
 cd researchbot
 
-# 安装依赖
+# 安装依赖  
 pip install -e .
 
 # 或者使用 uv (推荐)
