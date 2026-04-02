@@ -1,6 +1,6 @@
 [project]
-name = "nanobot-ai"
-version = "0.1.4.post6"
+name = "researchbot-ai"
+version = "0.1.0.post1"
 description = "researchbot - A lightweight personal AI assistant framework for research workflows"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
