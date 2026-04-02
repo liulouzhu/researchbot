@@ -129,8 +129,8 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["researchbot", "nanobot"]
-omit = ["tests/*", "**/tests/*", "nanobot/__init__.py", "nanobot/**/__init__.py"]
+source = ["researchbot"]
+omit = ["tests/*", "**/tests/*"]
 
 [tool.coverage.report]
 exclude_lines = [
