@@ -85,8 +85,6 @@ dev = [
 [project.scripts]
 # New primary entry point
 researchbot = "researchbot.cli.commands:app"
-# Backward-compatible entry point (deprecated, redirects to researchbot)
-nanobot = "nanobot.cli.commands:app"
 
 [build-system]
 requires = ["hatchling"]
