@@ -190,12 +190,121 @@ All tools return structured text with:
 6. **Flag uncertainty**: If information is incomplete, say "I'm not sure" rather than guessing
 7. **Suggest next steps**: Offer to save papers, download PDF, or generate detailed summary
 
+## Data Sources
+
+ResearchBot now supports multiple paper metadata sources:
+
+### arXiv
+- **Best for**: Preprints, recent papers, CS/ML papers
+- **Provides**: Titles, abstracts, authors, categories, PDF links
+- **URL**: https://arxiv.org
+
+### Crossref
+- **Best for**: Published journal articles, DOI resolution, citation counts
+- **Provides**: DOI, journal info, volume/issue/pages, publisher, references
+- **API**: https://api.crossref.org
+- **Requires**: Optional mailto for polite pool (recommended)
+
+### OpenAlex
+- **Best for**: Comprehensive paper metadata, concepts/topics, open access status
+- **Provides**: Citation counts, concepts, referenced works, OA status
+- **API**: https://api.openalex.org
+- **Requires**: API key (mandatory since 2026-02-13)
+
+## Automatic Enrichment
+
+When you save an arXiv paper or search for papers, ResearchBot can automatically enrich the metadata:
+
+1. If the paper has a DOI, Crossref is queried first for journal info
+2. OpenAlex provides citation counts, concepts, and references
+3. The enriched metadata is merged into the local paper record
+
+To enable automatic enrichment, configure your API keys (see Configuration section).
+
+## New Tools
+
+### 9. paper_enrich
+
+Enrich existing paper metadata with Crossref and OpenAlex data.
+
+```python
+# Enrich by arXiv ID
+paper_enrich(paper_id="2401.12345")
+
+# Enrich by DOI
+paper_enrich(doi="10.1000/xyz123")
+
+# Enrich by title
+paper_enrich(title="Attention is All You Need")
+
+# Enrich and save back to literature storage
+paper_enrich(paper_id="2401.12345", save=True)
+```
+
+**What it enriches:**
+- DOI (if not present)
+- Journal/venue information
+- Citation count
+- Referenced works
+- Concepts and topic tags
+- Open access status
+
+### 10. crossref_search
+
+Search Crossref directly for published papers.
+
+```python
+# Search by query
+crossref_search(query="transformer architecture")
+
+# Search with filters
+crossref_search(query="machine learning", year=2023, author="Hinton")
+
+# Search by DOI
+crossref_search(query="", doi="10.1000/xyz123")
+```
+
+**Crossref is best for:**
+- Finding published journal articles
+- Resolving DOIs to full metadata
+- Getting reference lists
+- Journal volume/issue/page info
+
+### 11. openalex_search
+
+Search OpenAlex for papers with rich metadata.
+
+```python
+# Search by query
+openalex_search(query="attention mechanism")
+
+# Search with filters
+openalex_search(query="deep learning", year=2023, author="Bengio")
+
+# Search by title
+openalex_search(query="language models", title="BERT")
+```
+
+**OpenAlex is best for:**
+- Getting citation counts
+- Finding related works
+- Getting concept/topic classifications
+- Open access status information
+
+## Enrichment Workflow
+
+For existing arXiv papers in your literature storage:
+
+1. **Enrich**: `paper_enrich(paper_id="2401.12345", save=True)`
+2. **View**: Check `literature/papers/2401.12345.json` for enriched fields
+3. **Update**: Re-enrich anytime to get latest citation counts
+
 ## Limitations
 
-- Currently only supports arXiv (no Crossref, PubMed, Semantic Scholar)
 - OCR not supported for scanned PDFs
 - No citation formatting built-in
 - Summary quality depends on extracted text quality
+- OpenAlex API key required for production use (without key, rate limited)
 
 ## Tips
 

@@ -547,6 +547,7 @@ def serve(
         mcp_servers=runtime_config.tools.mcp_servers,
         channels_config=runtime_config.channels,
         timezone=runtime_config.agents.defaults.timezone,
+        literature_config=runtime_config.literature,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -635,6 +636,7 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        literature_config=config.literature,
     )
 
     # Set cron callback (needs agent)
@@ -840,6 +842,7 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         timezone=config.agents.defaults.timezone,
+        literature_config=config.literature,
     )
 
     # Shared reference for progress callbacks

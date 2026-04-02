@@ -10,6 +10,9 @@
 - **论文比较** (`paper_compare`): 对多篇论文进行对比分析
 - **文献综述** (`paper_review`): 基于主题生成相关工作综述
 - **PDF下载** (`paper_pdf`): 自动下载论文PDF
+- **论文增强** (`paper_enrich`): 使用 Crossref/OpenAlex 丰富论文元数据
+- **Crossref搜索** (`crossref_search`): 直接搜索 Crossref 数据库
+- **OpenAlex搜索** (`openalex_search`): 直接搜索 OpenAlex 数据库
 
 ### 2. 智能代理
 - 支持多种大语言模型 (OpenAI GPT, Anthropic Claude, 本地 Ollama 等)
@@ -21,7 +24,6 @@
 - **命令行界面**: 直接在终端与助手交互
 - **Telegram Bot**: 通过 Telegram 与助手对话
 - **微信**: 支持企业微信机器人
-- **WhatsApp**: 通过 WhatsApp 接入
 
 ### 4. 定时任务
 - 支持 Cron 定时任务
@@ -69,8 +71,35 @@ vim ~/.researchbot/config.json
     "anthropic": {
       "apiKey": "your-api-key"
     }
+  },
+  "literature": {
+    "crossref": {
+      "mailto": "your-email@example.com"
+    },
+    "openalex": {
+      "apiKey": "your-openalex-api-key"
+    }
   }
 }
+```
+
+### Crossref / OpenAlex 配置
+
+Crossref 和 OpenAlex 是论文元数据来源，可以增强现有论文记录。
+
+**Crossref 配置：**
+- `mailto`: 用于 Crossref polite pool（推荐提供）
+- `userAgent`: 自定义 User-Agent
+- `apiBase`: API 基础地址（默认 https://api.crossref.org）
+
+**OpenAlex 配置：**
+- `apiKey`: API 密钥（2026-02-13 起必须使用）
+- `apiBase`: API 基础地址（默认 https://api.openalex.org）
+
+环境变量方式：
+```bash
+export RESEARCHBOT_LITERATURE__CROSSREF__MAILTO="your-email@example.com"
+export RESEARCHBOT_LITERATURE__OPENALEX__API_KEY="your-openalex-api-key"
 ```
 
 ### 使用

@@ -158,6 +158,28 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class CrossrefConfig(Base):
+    """Crossref API configuration."""
+
+    mailto: str = ""  # Email for Crossref polite pool (recommended)
+    user_agent: str = "researchbot/1.0"  # Custom User-Agent string
+    api_base: str = "https://api.crossref.org"  # API base URL
+
+
+class OpenAlexConfig(Base):
+    """OpenAlex API configuration."""
+
+    api_key: str = ""  # API key (required after 2026-02-13)
+    api_base: str = "https://api.openalex.org"  # API base URL
+
+
+class LiteratureConfig(Base):
+    """Literature/paper tools configuration."""
+
+    crossref: CrossrefConfig = Field(default_factory=CrossrefConfig)
+    openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for researchbot."""
 
@@ -167,6 +189,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    literature: LiteratureConfig = Field(default_factory=LiteratureConfig)
 
     @property
     def workspace_path(self) -> Path:

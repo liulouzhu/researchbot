@@ -174,6 +174,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
+        literature_config: Any = None,
     ):
         from researchbot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -189,6 +190,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.literature_config = literature_config
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
@@ -263,6 +265,11 @@ class AgentLoop:
             PaperSearchTool,
             PaperSummarizeTool,
         )
+        from researchbot.agent.tools.paper_enrich import (
+            PaperEnrichTool,
+            CrossrefSearchTool,
+            OpenAlexSearchTool,
+        )
         self.tools.register(PaperSearchTool(proxy=self.web_proxy))
         self.tools.register(PaperGetTool(proxy=self.web_proxy))
         self.tools.register(PaperSaveTool(workspace=str(self.workspace)))
@@ -271,6 +278,23 @@ class AgentLoop:
         self.tools.register(PaperExtractTextTool(workspace=str(self.workspace), proxy=self.web_proxy))
         self.tools.register(PaperCompareTool(provider=self.provider, workspace=str(self.workspace), proxy=self.web_proxy))
         self.tools.register(PaperReviewTool(provider=self.provider, workspace=str(self.workspace), proxy=self.web_proxy))
+
+        # Register Crossref/OpenAlex enrichment tools
+        crossref_config = getattr(self.literature_config, "crossref", None) if self.literature_config else None
+        openalex_config = getattr(self.literature_config, "openalex", None) if self.literature_config else None
+
+        crossref_mailto = getattr(crossref_config, "mailto", None) if crossref_config else None
+        crossref_ua = getattr(crossref_config, "user_agent", None) if crossref_config else None
+        openalex_api_key = getattr(openalex_config, "api_key", None) if openalex_config else None
+
+        self.tools.register(CrossrefSearchTool(mailto=crossref_mailto, user_agent=crossref_ua, proxy=self.web_proxy))
+        self.tools.register(OpenAlexSearchTool(api_key=openalex_api_key, proxy=self.web_proxy))
+        self.tools.register(PaperEnrichTool(
+            crossref_mailto=crossref_mailto,
+            openalex_api_key=openalex_api_key,
+            workspace=str(self.workspace),
+            proxy=self.web_proxy,
+        ))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
