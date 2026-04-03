@@ -4,7 +4,7 @@ import base64
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +53,11 @@ def ensure_dir(path: Path) -> Path:
 def timestamp() -> str:
     """Current ISO timestamp."""
     return datetime.now().isoformat()
+
+
+def utc_now() -> str:
+    """Current UTC ISO timestamp."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def current_time_str(timezone: str | None = None) -> str:

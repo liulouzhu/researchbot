@@ -172,6 +172,75 @@ researchbot paper compare "paper1.pdf" "paper2.pdf"
 researchbot paper review "大语言模型安全"
 ```
 
+#### 创新点工作流 (`innovation_workflow`)
+
+`innovation_workflow` 是科研创新点发现工具，从研究主题出发，经历"生成候选 → 查新评估 → 审阅评分 → 多轮迭代收敛"四个阶段，帮助从粗想法逐步收敛为有证据支撑的可行创新方向。
+
+**基础用法：**
+```bash
+# 生成 5 个关于 LLM 安全性的创新点候选
+researchbot agent -m "innovation_workflow topic=\"LLM security\" num_candidates=5 top_k=3"
+
+# 开启多轮迭代模式
+researchbot agent -m "innovation_workflow topic=\"LLM security\" enable_iteration=True max_rounds=3"
+
+# 覆盖已有结果重新运行
+researchbot agent -m "innovation_workflow topic=\"LLM security\" overwrite=True"
+```
+
+**四阶段工作流：**
+
+| 阶段 | 说明 |
+|------|------|
+| Stage 1 | 根据主题和本地文献上下文生成 3-8 个创新点候选 |
+| Stage 2 | 对每个候选进行本地 + 线上（arXiv）查新，分析新颖性 |
+| Stage 3 | 基于证据对每个候选评分（novelty/feasibility/evidence/impact/risk）并给出决策 |
+| Stage 4（可选） | 对"revise"候选进行多轮修订和再审阅，逐步收敛 |
+
+**输出文件结构：**
+```
+innovation/<topic_slug>/
+├── workflow.json           # 工作流元数据（版本、参数、阶段状态）
+├── candidates.json / .md    # 初始候选列表
+├── novelty_report.json / .md
+├── review_report.json / .md
+├── iterations/
+│   ├── round_0/
+│   ├── round_1/            # （如有迭代）
+│   └── round_N/
+├── iteration_report.json     # 迭代汇总（含各轮统计和最终推荐）
+└── iteration_report.md     # 人类可读的迭代总结
+```
+
+**迭代模式参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `enable_iteration` | `False` | 是否开启多轮迭代（需 `enable_review=True`） |
+| `max_rounds` | `2` | 最大迭代轮数（1-5） |
+| `min_proceed` | `1` | 达到该数量 `proceed` 候选后提前停止 |
+| `revise_top_k` | `3` | 每轮最多修订的候选数量 |
+| `stop_if_no_change` | `True` | 本轮无新增 `proceed` 时停止 |
+
+**推荐评分与决策规则：**
+
+评分维度：novelty、feasibility、evidence、impact（各 1-10）；risk（1-10，越高风险越大）。
+
+综合得分：`overall = novelty×0.20 + feasibility×0.25 + evidence×0.15 + impact×0.20 + (10-risk)×0.20`
+
+决策：
+- `proceed`：evidence≥6 且 feasibility≥5 且 risk≤4
+- `revise`：有潜力但需强化
+- `drop`：feasibility≤3 或 evidence≤3 或 risk≥7 或 is_duplicate=true
+
+**迭代停止条件（任一满足即停）：**
+- 达到 `max_rounds`
+- 累计 `proceed` 候选数 ≥ `min_proceed`
+- 本轮无新增 `proceed` 且 `stop_if_no_change=True`
+- 无更多可修订的候选
+
+**创新线去重：** 迭代模式下，同一 `parent_candidate`（或原始 title）的多个修订版本会按 lineage 去重，仅保留得分最高者，确保 top-K 推荐覆盖不同创新线。
+
 #### 引文导出
 
 支持 6 种引文格式导出：**BibTeX**、**RIS**、**CSL-JSON**、**APA**、**MLA**、**GB/T 7714**。

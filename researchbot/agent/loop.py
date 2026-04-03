@@ -275,6 +275,7 @@ class AgentLoop:
             PaperIndexTool,
         )
         from researchbot.agent.tools.paper_cite import PaperCiteTool
+        from researchbot.agent.tools.innovation import InnovationWorkflowTool
         semantic_config = getattr(self.literature_config, "semantic_search", None) if self.literature_config else None
 
         self.tools.register(PaperSearchTool(proxy=self.web_proxy))
@@ -285,6 +286,7 @@ class AgentLoop:
         self.tools.register(PaperExtractTextTool(workspace=str(self.workspace), proxy=self.web_proxy))
         self.tools.register(PaperCompareTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(PaperReviewTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
+        self.tools.register(InnovationWorkflowTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
 
         # Register Crossref/OpenAlex enrichment tools
         crossref_config = getattr(self.literature_config, "crossref", None) if self.literature_config else None
