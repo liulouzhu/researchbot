@@ -274,6 +274,7 @@ class AgentLoop:
             PaperSearchLocalTool,
             PaperIndexTool,
         )
+        from researchbot.agent.tools.paper_cite import PaperCiteTool
         semantic_config = getattr(self.literature_config, "semantic_search", None) if self.literature_config else None
 
         self.tools.register(PaperSearchTool(proxy=self.web_proxy))
@@ -312,6 +313,10 @@ class AgentLoop:
             workspace=str(self.workspace),
             semantic_config=semantic_config,
         ))
+
+        # Register citation export tool
+        self.tools.register(PaperCiteTool(workspace=str(self.workspace)))
+
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:

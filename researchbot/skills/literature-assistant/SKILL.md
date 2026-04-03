@@ -28,6 +28,8 @@ Use this skill immediately when the user asks any of:
 - "literature review for", "主题综述"
 - "related work on", "相关工作"
 - "research gaps", "研究空白"
+- "citation", "cite this", "bibtex", "bibliography"
+- "引用", "导出引用", "参考文献格式", "参考文献"
 
 ## Available Tools
 
@@ -299,10 +301,58 @@ For existing arXiv papers in your literature storage:
 2. **View**: Check `literature/papers/2401.12345.json` for enriched fields
 3. **Update**: Re-enrich anytime to get latest citation counts
 
+## Citation Export
+
+### 14. paper_cite
+
+Export paper citations in standard academic formats for use in manuscripts, reference managers, and bibliographies.
+
+```python
+# Export single paper as BibTeX
+paper_cite(paper_id="2401.12345", format="bibtex")
+
+# Export multiple papers as RIS (for Zotero/EndNote)
+paper_cite(paper_ids=["2401.12345", "2301.45678"], format="ris")
+
+# Export all local papers as CSL-JSON
+paper_cite(format="csl-json")
+
+# Export to file
+paper_cite(paper_id="2401.12345", format="bibtex", output="file", path="refs.bib")
+
+# Export a paper dict directly (without loading from local storage)
+paper_cite(paper={...paper_object...}, format="apa")
+```
+
+**Supported formats:**
+
+| Format | Description | Typical Use |
+|--------|-------------|-------------|
+| `bibtex` | BibTeX entries | LaTeX manuscripts |
+| `ris` | RIS tag format | EndNote, Zotero, Mendeley |
+| `csl-json` | CSL-JSON objects | Pandoc, Citeproc |
+| `apa` | APA 7th edition | Social science papers |
+| `mla` | MLA 9th edition | Humanities papers |
+| `gbt7714` | GB/T 7714-2015 | Chinese academic papers |
+
+**Parameters:**
+- `paper_id`: Export a single paper by ID
+- `paper_ids`: Export multiple papers by ID list
+- `paper`: Export a paper dict directly
+- `format`: Output format (default: `bibtex`)
+- `output`: `text` (default) or `file`
+- `path`: File path for `file` mode (defaults to `literature/citations/export.<ext>`)
+
+**Citekey format:** Deterministic keys like `vaswani2017attention` (first author last name + year + title words). DOI suffix appended for uniqueness.
+
+**Workflow:** When user asks for citations, references, bibliography, or export:
+1. If papers are not yet saved, search and save first
+2. Use `paper_cite` with the desired format
+3. For manuscript preparation, export to file with `output="file"`
+
 ## Limitations
 
 - OCR not supported for scanned PDFs
-- No citation formatting built-in
 - Summary quality depends on extracted text quality
 - OpenAlex API key required for production use (without key, rate limited)
 

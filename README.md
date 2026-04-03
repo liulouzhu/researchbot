@@ -13,6 +13,7 @@
 - **论文增强** (`paper_enrich`): 使用 Crossref/OpenAlex 丰富论文元数据
 - **Crossref搜索** (`crossref_search`): 直接搜索 Crossref 数据库
 - **OpenAlex搜索** (`openalex_search`): 直接搜索 OpenAlex 数据库
+- **引文导出** (`paper_cite`): 将论文导出为 BibTeX、RIS、CSL-JSON、APA、MLA、GB/T 7714 格式
 
 ### 2. 智能代理
 - 支持多种大语言模型 (OpenAI GPT, Anthropic Claude, 本地 Ollama 等)
@@ -170,6 +171,36 @@ researchbot paper compare "paper1.pdf" "paper2.pdf"
 # 生成文献综述
 researchbot paper review "大语言模型安全"
 ```
+
+#### 引文导出
+
+支持 6 种引文格式导出：**BibTeX**、**RIS**、**CSL-JSON**、**APA**、**MLA**、**GB/T 7714**。
+
+```bash
+# 在对话中导出单篇论文 BibTeX
+paper_cite paper_id="2401.12345" format="bibtex"
+
+# 导出多篇论文为 RIS
+paper_cite paper_ids=["2401.12345", "2301.45678"] format="ris"
+
+# 导出全部本地论文为 GB/T 7714 格式
+paper_cite format="gbt7714"
+
+# 导出到文件
+paper_cite paper_id="2401.12345" format="bibtex" output="file" path="refs.bib"
+```
+
+**支持的格式：**
+| 格式 | 说明 | 典型用途 |
+|------|------|---------|
+| `bibtex` | BibTeX 条目 | LaTeX 论文 |
+| `ris` | RIS 格式 | EndNote, Zotero, Mendeley |
+| `csl-json` | CSL-JSON 对象 | Pandoc, Citeproc |
+| `apa` | APA 第 7 版 | 社会科学论文 |
+| `mla` | MLA 第 9 版 | 人文学科论文 |
+| `gbt7714` | GB/T 7714-2015 | 中文论文 |
+
+**Citekey 规则：** `第一作者姓 + 年份 + 标题关键词`（如 `vaswani2017attention`），DOI 后缀用于去重。
 
 #### 启动网关服务
 
