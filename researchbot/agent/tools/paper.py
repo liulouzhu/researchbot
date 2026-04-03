@@ -16,6 +16,8 @@ from researchbot.agent.tools.arxiv_client import (
     search_arxiv,
     DEFAULT_TIMEOUT,
 )
+from researchbot.config.schema import SemanticSearchConfig
+from researchbot.search_index import SearchIndex
 
 
 def _format_paper(entry: PaperEntry) -> str:
@@ -277,8 +279,14 @@ class PaperSaveTool(Tool):
         "required": ["paper"],
     }
 
-    def __init__(self, workspace: str | None = None):
+    def __init__(
+        self,
+        workspace: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
+    ):
         self._workspace = Path(workspace) if workspace else None
+        self._semantic_config = semantic_config
+        self._search_index: SearchIndex | None = None
 
     def _resolve_path(self, path: str) -> Path:
         """Resolve path within workspace."""
@@ -286,6 +294,15 @@ class PaperSaveTool(Tool):
         if not p.is_absolute() and self._workspace:
             p = self._workspace / p
         return p
+
+    def _get_search_index(self) -> SearchIndex | None:
+        """Get or create the search index."""
+        if self._workspace is None or self._semantic_config is None:
+            return None
+        if self._search_index is None:
+            db_path = self._resolve_path(self._semantic_config.sqlite_db_path)
+            self._search_index = SearchIndex(db_path, self._semantic_config)
+        return self._search_index
 
     def _ensure_dir(self, path: Path) -> None:
         """Ensure directory exists."""
@@ -359,6 +376,16 @@ class PaperSaveTool(Tool):
             papers_list.append(paper_record)
         index["papers"] = papers_list
         self._save_index(index_path, index)
+
+        # Update search index
+        search_index = self._get_search_index()
+        if search_index is not None:
+            try:
+                await search_index.initialize()
+                await search_index.upsert_paper(paper_record)
+                search_index.close()
+            except Exception:
+                pass  # Don't fail if index update fails
 
         return (
             f"Saved paper: {paper_id}\n"
@@ -558,10 +585,13 @@ class PaperSummarizeTool(Tool):
         provider: Any = None,
         workspace: str | None = None,
         proxy: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
     ):
         self._provider = provider
         self._workspace = Path(workspace) if workspace else None
         self._proxy = proxy
+        self._semantic_config = semantic_config
+        self._search_index: SearchIndex | None = None
 
     def _resolve_path(self, path: str) -> Path:
         """Resolve path within workspace."""
@@ -569,6 +599,15 @@ class PaperSummarizeTool(Tool):
         if not p.is_absolute() and self._workspace:
             p = self._workspace / p
         return p
+
+    def _get_search_index(self) -> SearchIndex | None:
+        """Get or create the search index."""
+        if self._workspace is None or self._semantic_config is None:
+            return None
+        if self._search_index is None:
+            db_path = self._resolve_path(self._semantic_config.sqlite_db_path)
+            self._search_index = SearchIndex(db_path, self._semantic_config)
+        return self._search_index
 
     def _ensure_dir(self, path: Path) -> None:
         """Ensure directory exists."""
@@ -892,6 +931,16 @@ class PaperSummarizeTool(Tool):
         saved_path = ""
         if save and resolved_paper_id and resolved_paper_id != "unknown":
             saved_path = self._save_summary(resolved_paper_id, summary, resolved_paper)
+
+            # Update search index after saving summary
+            search_index = self._get_search_index()
+            if search_index is not None:
+                try:
+                    await search_index.initialize()
+                    await search_index.upsert_paper(resolved_paper)
+                    search_index.close()
+                except Exception:
+                    pass  # Don't fail if index update fails
 
         return self._build_summary_result(summary, resolved_paper_id, saved_path, text_source)
 
@@ -1337,10 +1386,13 @@ class PaperCompareTool(Tool):
         workspace: str | None = None,
         provider: Any = None,
         proxy: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
     ):
         self._workspace = Path(workspace) if workspace else None
         self._provider = provider
         self._proxy = proxy
+        self._semantic_config = semantic_config
+        self._search_index: SearchIndex | None = None
 
     def _resolve_path(self, relative: str) -> Path:
         if not self._workspace:
@@ -1377,8 +1429,50 @@ class PaperCompareTool(Tool):
                 continue
         return papers
 
+    def _get_search_index(self) -> SearchIndex | None:
+        """Get or create the search index."""
+        if self._workspace is None or self._semantic_config is None:
+            return None
+        if self._search_index is None:
+            db_path = self._resolve_path(self._semantic_config.sqlite_db_path)
+            self._search_index = SearchIndex(db_path, self._semantic_config)
+        return self._search_index
+
     def _find_relevant_papers(self, topic: str, max_papers: int = 5) -> list[dict[str, Any]]:
-        """Find papers relevant to a topic from local storage."""
+        """Find papers relevant to a topic from local storage.
+
+        First tries semantic search if available, falls back to keyword matching.
+        """
+        # Try semantic search first
+        search_index = self._get_search_index()
+        if search_index is not None:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If we're already in an async context, we can't use await here
+                    pass
+                else:
+                    results = loop.run_until_complete(search_index.initialize())
+                    results = loop.run_until_complete(
+                        search_index.search(topic, top_k=max_papers, rerank=False)
+                    )
+                    search_index.close()
+                    if results:
+                        # Load full paper data for each result
+                        papers = []
+                        for r in results:
+                            paper_id = r.get("paper_id")
+                            if paper_id:
+                                paper = self._load_local_paper(paper_id)
+                                if paper:
+                                    papers.append(paper)
+                        if papers:
+                            return papers
+            except Exception:
+                pass
+
+        # Fallback to keyword matching
         all_papers = self._load_all_papers()
         if not all_papers:
             return []
@@ -1608,10 +1702,13 @@ class PaperReviewTool(Tool):
         workspace: str | None = None,
         provider: Any = None,
         proxy: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
     ):
         self._workspace = Path(workspace) if workspace else None
         self._provider = provider
         self._proxy = proxy
+        self._semantic_config = semantic_config
+        self._search_index: SearchIndex | None = None
 
     def _resolve_path(self, relative: str) -> Path:
         if not self._workspace:
@@ -1647,8 +1744,50 @@ class PaperReviewTool(Tool):
                 continue
         return papers
 
+    def _get_search_index(self) -> SearchIndex | None:
+        """Get or create the search index."""
+        if self._workspace is None or self._semantic_config is None:
+            return None
+        if self._search_index is None:
+            db_path = self._resolve_path(self._semantic_config.sqlite_db_path)
+            self._search_index = SearchIndex(db_path, self._semantic_config)
+        return self._search_index
+
     def _find_relevant_papers(self, topic: str, max_papers: int = 10) -> list[dict[str, Any]]:
-        """Find papers relevant to a topic from local storage."""
+        """Find papers relevant to a topic from local storage.
+
+        First tries semantic search if available, falls back to keyword matching.
+        """
+        # Try semantic search first
+        search_index = self._get_search_index()
+        if search_index is not None:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If we're already in an async context, we can't use await here
+                    pass
+                else:
+                    loop.run_until_complete(search_index.initialize())
+                    results = loop.run_until_complete(
+                        search_index.search(topic, top_k=max_papers, rerank=False)
+                    )
+                    search_index.close()
+                    if results:
+                        # Load full paper data for each result
+                        papers = []
+                        for r in results:
+                            paper_id = r.get("paper_id")
+                            if paper_id:
+                                paper = self._load_local_paper(paper_id)
+                                if paper:
+                                    papers.append(paper)
+                        if papers:
+                            return papers
+            except Exception:
+                pass
+
+        # Fallback to keyword matching
         all_papers = self._load_all_papers()
         if not all_papers:
             return []

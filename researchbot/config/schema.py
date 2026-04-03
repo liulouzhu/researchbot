@@ -173,11 +173,29 @@ class OpenAlexConfig(Base):
     api_base: str = "https://api.openalex.org"  # API base URL
 
 
+class SemanticSearchConfig(Base):
+    """Local semantic search configuration using SQLite."""
+
+    sqlite_db_path: str = "literature/indexes/search.sqlite3"
+    embedding_model: str = "text-embedding-v4"  #阿里云 embedding 模型名
+    embedding_provider: str = "dashscope"  # 使用哪个 provider 做 embedding
+    embedding_api_key: str = ""  # 如果 provider 没有全局 key
+    embedding_api_base: str = ""  # 如果 provider 需要自定义 api_base
+    embedding_dimension: int = 0  # embedding 向量维度（0=自动检测）
+    enable_sqlite_vec: bool = True  # 是否启用 sqlite-vec（不支持时自动降级）
+    enable_rerank: bool = True  # 是否启用 rerank
+    rerank_top_k: int = 20  # rerank 候选数量
+    hybrid_search_rrf_k: int = 60  # RRF 融合参数
+    lexical_weight: float = 0.3  # 关键词检索权重
+    vector_weight: float = 0.7  # 向量检索权重
+
+
 class LiteratureConfig(Base):
     """Literature/paper tools configuration."""
 
     crossref: CrossrefConfig = Field(default_factory=CrossrefConfig)
     openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
+    semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
 
 
 class Config(BaseSettings):

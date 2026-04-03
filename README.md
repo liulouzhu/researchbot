@@ -102,6 +102,44 @@ export RESEARCHBOT_LITERATURE__CROSSREF__MAILTO="your-email@example.com"
 export RESEARCHBOT_LITERATURE__OPENALEX__API_KEY="your-openalex-api-key"
 ```
 
+### 本地语义检索
+
+对本地保存的论文进行语义搜索，结合关键词和向量相似度。
+
+#### 快速配置
+
+**1. 安装 sqlite-vec（如需向量检索）：**
+```bash
+uv pip install sqlite-vec
+```
+
+**2. 配置（config.json）：**
+```json
+{
+  "literature": {
+    "semanticSearch": {
+      "sqliteDbPath": "literature/indexes/search.sqlite3",
+      "embeddingProvider": "dashscope",
+      "embeddingApiKey": "your-api-key",
+      "embeddingModel": "text-embedding-v4",
+      "embeddingDimension": 1024
+    }
+  }
+}
+```
+
+#### 使用
+
+```bash
+# 搜索本地论文
+researchbot paper search-local "机器学习安全"
+
+# 手动重建索引
+researchbot paper index --rebuild
+```
+
+论文会在保存时自动索引。
+
 ### 使用
 
 #### 命令行对话

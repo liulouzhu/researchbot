@@ -270,14 +270,20 @@ class AgentLoop:
             CrossrefSearchTool,
             OpenAlexSearchTool,
         )
+        from researchbot.agent.tools.paper_search_local import (
+            PaperSearchLocalTool,
+            PaperIndexTool,
+        )
+        semantic_config = getattr(self.literature_config, "semantic_search", None) if self.literature_config else None
+
         self.tools.register(PaperSearchTool(proxy=self.web_proxy))
         self.tools.register(PaperGetTool(proxy=self.web_proxy))
-        self.tools.register(PaperSaveTool(workspace=str(self.workspace)))
-        self.tools.register(PaperSummarizeTool(provider=self.provider, workspace=str(self.workspace), proxy=self.web_proxy))
+        self.tools.register(PaperSaveTool(workspace=str(self.workspace), semantic_config=semantic_config))
+        self.tools.register(PaperSummarizeTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(PaperDownloadPdfTool(workspace=str(self.workspace), proxy=self.web_proxy))
         self.tools.register(PaperExtractTextTool(workspace=str(self.workspace), proxy=self.web_proxy))
-        self.tools.register(PaperCompareTool(provider=self.provider, workspace=str(self.workspace), proxy=self.web_proxy))
-        self.tools.register(PaperReviewTool(provider=self.provider, workspace=str(self.workspace), proxy=self.web_proxy))
+        self.tools.register(PaperCompareTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
+        self.tools.register(PaperReviewTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
 
         # Register Crossref/OpenAlex enrichment tools
         crossref_config = getattr(self.literature_config, "crossref", None) if self.literature_config else None
@@ -293,7 +299,18 @@ class AgentLoop:
             crossref_mailto=crossref_mailto,
             openalex_api_key=openalex_api_key,
             workspace=str(self.workspace),
+            semantic_config=semantic_config,
             proxy=self.web_proxy,
+        ))
+
+        # Register local semantic search tools
+        self.tools.register(PaperSearchLocalTool(
+            workspace=str(self.workspace),
+            semantic_config=semantic_config,
+        ))
+        self.tools.register(PaperIndexTool(
+            workspace=str(self.workspace),
+            semantic_config=semantic_config,
         ))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))

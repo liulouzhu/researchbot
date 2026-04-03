@@ -319,3 +319,152 @@ For existing arXiv papers in your literature storage:
   - `literature/extracted/<paper_id>.txt` - extracted text
   - `literature/reviews/<topic_slug>.json` - literature review (structured)
   - `literature/reviews/<topic_slug>.md` - literature review (markdown)
+  - `literature/indexes/search.sqlite3` - semantic search index (SQLite)
+
+## Local Semantic Search
+
+ResearchBot supports **local semantic search** over your saved papers. This enables:
+- Semantic similarity search (find papers by meaning, not just keywords)
+- Hybrid search combining keyword + vector matching
+- Filtering by topic, tags, year, categories, source
+- Automatic reranking with LLM for better relevance
+
+### How It Works
+
+1. **Automatic Indexing**: Papers are indexed automatically when saved/summarized/enriched
+2. **FTS5 Keyword Search**: Traditional keyword matching with BM25 ranking
+3. **Vector Search**: Using sqlite-vec for semantic similarity (if available)
+4. **Hybrid Fusion**: Combines keyword and vector scores using RRF
+5. **LLM Rerank**: Re-ranks top candidates using a language model
+
+### 12. paper_search_local
+
+Search local papers using semantic search.
+
+```python
+# Basic semantic search
+paper_search_local(query="machine learning security")
+
+# With filters
+paper_search_local(
+    query="deep learning for graphs",
+    topic="graph neural networks",
+    tags=["GNN", "attention"],
+    year_from=2022,
+    year_to=2024,
+    top_k=10,
+    rerank=True
+)
+
+# Search by source
+paper_search_local(query="transformer", source="arxiv")
+```
+
+**Parameters:**
+- `query` (required): Search query string
+- `top_k`: Maximum results to return (default: 10)
+- `topic`: Filter by topic (substring match)
+- `tags`: Filter by tags (any match)
+- `year`: Filter by exact year
+- `year_from` / `year_to`: Year range filter
+- `categories`: Filter by categories
+- `source`: Filter by source (arxiv, crossref, openalex)
+- `rerank`: Apply LLM reranking (default: True)
+
+### 13. paper_index
+
+Manage the local search index.
+
+```python
+# Rebuild entire index from all local papers
+paper_index(rebuild=True)
+
+# Index a specific paper
+paper_index(paper_id="2401.12345")
+```
+
+### Index Updates
+
+The search index is **automatically updated** when you:
+- Save a paper (`paper_save`)
+- Generate a summary (`paper_summarize`)
+- Enrich paper metadata (`paper_enrich`)
+
+You normally don't need to manually rebuild the index unless:
+- You've added papers before semantic search was configured
+- The index file was corrupted
+- You want to re-index with new embedding settings
+
+### Fallback Behavior
+
+The system distinguishes between "disabled" and "unavailable":
+
+**embedding 未配置（`embeddingApiKey` 为空）：**
+- 完全不调用 embedding 服务，不报错
+- 纯 FTS5 关键词检索，滤波功能正常工作
+- 检索质量略有下降（无语义相似度）
+
+**sqlite-vec 配置关闭（`enableSqliteVec=false`）：**
+- 完全不尝试加载 sqlite-vec 扩展
+- 纯 FTS5 检索
+
+**sqlite-vec 环境不可用（但 `enableSqliteVec=true`）：**
+- 尝试加载失败后自动降级到纯 FTS5
+- 不报错，不影响基础功能
+
+**embedding 服务运行时失败：**
+- runtime 状态标记为不可用
+- 已有结果不受影响，不报错
+
+### Configuration
+
+The semantic search is configured via the `literature.semanticSearch` section:
+
+```json
+{
+  "literature": {
+    "semanticSearch": {
+      "sqliteDbPath": "literature/indexes/search.sqlite3",
+      "embeddingModel": "text-embedding-v4",
+      "embeddingProvider": "dashscope",
+      "embeddingApiKey": "your-api-key",
+      "embeddingApiBase": "",
+      "enableSqliteVec": true,
+      "enableRerank": true,
+      "rerankTopK": 20,
+      "hybridSearchRrfK": 60,
+      "lexicalWeight": 0.3,
+      "vectorWeight": 0.7
+    }
+  }
+}
+```
+
+**配置说明：**
+- `embeddingApiKey` **不配置则不启用向量检索**，FTS5 检索仍然正常工作
+- `enableSqliteVec` 设为 `false` 则完全不加载 sqlite-vec 扩展
+- `rerankTopK`: LLM rerank 的候选数量
+- `hybridSearchRrfK`: RRF 融合的 k 值
+
+**阿里云 dashscope 配置示例：**
+```bash
+export RESEARCHBOT_LITERATURE__SEMANTIC_SEARCH__EMBEDDING_PROVIDER="dashscope"
+export RESEARCHBOT_LITERATURE__SEMANTIC_SEARCH__EMBEDDING_API_KEY="your-dashscope-api-key"
+export RESEARCHBOT_LITERATURE__SEMANTIC_SEARCH__EMBEDDING_MODEL="text-embedding-v4"
+```
+
+**最小配置（仅 FTS5）：**
+```json
+{
+  "literature": {
+    "semanticSearch": {
+      "sqliteDbPath": "literature/indexes/search.sqlite3"
+    }
+  }
+}
+```
+
+### SQLite 文件位置
+
+- 路径：`workspace/literature/indexes/search.sqlite3`
+- 数据库包含表：`papers`, `papers_fts`, `paper_embeddings`, `paper_vectors` (如果 sqlite-vec 可用)

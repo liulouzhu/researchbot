@@ -18,6 +18,8 @@ from researchbot.agent.tools.metadata_merge import (
     normalize_from_crossref,
     normalize_from_openalex,
 )
+from researchbot.config.schema import SemanticSearchConfig
+from researchbot.search_index import SearchIndex
 
 
 DEFAULT_TIMEOUT = 30.0
@@ -381,11 +383,14 @@ class PaperEnrichTool(Tool):
         openalex_api_key: str | None = None,
         workspace: str | None = None,
         proxy: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
     ):
         self.crossref_mailto = crossref_mailto
         self.openalex_api_key = openalex_api_key
         self._workspace = Path(workspace) if workspace else None
         self._proxy = proxy
+        self._semantic_config = semantic_config
+        self._search_index: SearchIndex | None = None
 
     def _resolve_path(self, path: str) -> Path:
         """Resolve path within workspace."""
@@ -393,6 +398,15 @@ class PaperEnrichTool(Tool):
         if not p.is_absolute() and self._workspace:
             p = self._workspace / p
         return p
+
+    def _get_search_index(self) -> SearchIndex | None:
+        """Get or create the search index."""
+        if self._workspace is None or self._semantic_config is None:
+            return None
+        if self._search_index is None:
+            db_path = self._resolve_path(self._semantic_config.sqlite_db_path)
+            self._search_index = SearchIndex(db_path, self._semantic_config)
+        return self._search_index
 
     def _load_local_paper(self, paper_id: str) -> dict[str, Any] | None:
         """Load paper from local storage."""
@@ -535,6 +549,16 @@ class PaperEnrichTool(Tool):
             if not result.get("paper_id"):
                 result["paper_id"] = _make_safe_paper_id(result)
             saved_path = self._save_enriched(result)
+
+            # Update search index
+            search_index = self._get_search_index()
+            if search_index is not None:
+                try:
+                    await search_index.initialize()
+                    await search_index.upsert_paper(result)
+                    search_index.close()
+                except Exception:
+                    pass  # Don't fail if index update fails
 
         # Format output
         lines = [
