@@ -6,8 +6,11 @@ metadata: {"researchbot":{"emoji":"💡"}}
 
 # Innovation Workflow
 
-Generate and evaluate innovation point candidates for research topics. This workflow helps identify novel research directions through three stages:
+> **⚠️ CRITICAL: When user asks for innovation points, ALWAYS call the `innovation_workflow` tool directly. NEVER use `exec` to import or run Python modules. When user says "再换几个", "别的", "再帮我想", "重新生成", or "different/another batch" → you MUST pass `overwrite=True` to the tool.**
 
+Generate and evaluate innovation point candidates for research topics. This workflow helps identify novel research directions through these stages:
+
+0. **Landscape Survey** (optional) — scan local papers, search arXiv/Crossref/OpenAlex, build a literature map
 1. **Generate candidates** from a research topic/problem
 2. **Search related work** in local literature and arXiv, assess novelty
 3. **Review and score** each candidate, produce final recommendations
@@ -25,11 +28,16 @@ Use this skill when the user asks:
 - "review research ideas", "审阅研究想法"
 - "score innovation points", "评分创新点"
 
+**IMPORTANT: When the user's message contains `innovation_workflow` followed by arguments (e.g., `innovation_workflow topic="..."`), ALWAYS call the `innovation_workflow` tool with those arguments. Do NOT treat it as Python code to execute with `exec`.**
+
 ## Available Tools
 
 ### innovation_workflow
 
 Generate innovation point candidates, perform novelty search, and review/score.
+
+When the user asks for "another batch", "different ideas", "再换几个", "别的", or "重新生成", call this tool with `overwrite=True` so the workflow does not reuse cached files from the previous run.
+Do **not** shell out with `exec` to import a helper module when `innovation_workflow` is available directly.
 
 ```python
 # Basic usage - generates candidates, searches novelty, and reviews all
@@ -59,10 +67,28 @@ innovation_workflow(topic="my research topic", overwrite=True)
 - `min_proceed`: Stop iterating when this many "proceed" candidates found (default: 1)
 - `revise_top_k`: Max revise candidates to revise per round (default: 3)
 - `stop_if_no_change`: Stop if no new proceed candidates in a round (default: True)
+- `enable_landscape`: Enable landscape survey before candidate generation (default: False)
+- `landscape_max_online`: Max papers per online source in landscape survey (default: 8)
 
 > **Note:** `enable_iteration=True` requires `enable_review=True`. The iteration loop depends on review scores to decide which candidates to revise and when to stop.
 
 ## Workflow Stages
+
+### Stage 0: Landscape Survey (if enable_landscape=True)
+
+Before generating candidates, scan the research landscape:
+
+1. **Local scan**: Search local paper library using semantic search (up to 15 papers)
+2. **Multi-source online search**: Query arXiv, Crossref, and OpenAlex concurrently (up to `landscape_max_online` per source)
+3. **Deduplication**: Merge results, removing duplicates by title similarity
+4. **Literature map construction**: LLM categorizes papers into 3-6 thematic research directions
+5. **Context enrichment**: Landscape findings feed into candidate generation context
+
+The literature map includes per-category:
+- Representative papers, main problems, typical methods
+- Covered gaps, limitations, exploration opportunities
+
+Overall summary includes trends, key gaps, and recommended exploration directions.
 
 ### Stage 1: Candidate Generation
 
@@ -147,6 +173,8 @@ Results are saved to `innovation/<topic_slug>/`:
 
 | File | Description |
 |------|-------------|
+| `landscape_report.json` | Landscape survey with local/online papers and literature map (if enable_landscape=True) |
+| `landscape_report.md` | Human-readable landscape report (if enable_landscape=True) |
 | `candidates.json` | Structured JSON of all candidates |
 | `candidates.md` | Human-readable markdown of candidates |
 | `novelty_report.json` | Structured JSON of novelty analysis |
@@ -178,6 +206,7 @@ Results are saved to `innovation/<topic_slug>/`:
 3. **Use overwrite carefully**: It regenerates all stages
 4. **Review the review scores**: Look at feasibility and risk, not just novelty
 5. **Consider top_k**: Default is 3, adjust based on your needs
+6. **When the user wants new/different ideas**: use `overwrite=True` so the workflow does not reuse an older batch from the same topic directory.
 
 ## Example
 
@@ -185,6 +214,15 @@ Results are saved to `innovation/<topic_slug>/`:
 # Generate innovation points with full review
 result = innovation_workflow(
     topic="efficient inference for large language models",
+    num_candidates=6,
+    enable_review=True,
+    top_k=3,
+)
+
+# With landscape survey (scan local + arXiv/Crossref/OpenAlex + literature map)
+result = innovation_workflow(
+    topic="efficient inference for large language models",
+    enable_landscape=True,
     num_candidates=6,
     enable_review=True,
     top_k=3,

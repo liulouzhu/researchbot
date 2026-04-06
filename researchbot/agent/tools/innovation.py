@@ -11,8 +11,8 @@ from typing import Any
 from researchbot.agent.tools.base import Tool
 from researchbot.utils.helpers import utc_now
 
-WORKFLOW_VERSION = "1.1.0"
-PROMPT_VERSION = "1.1.0"
+WORKFLOW_VERSION = "1.2.0"
+PROMPT_VERSION = "1.2.0"
 
 # =============================================================================
 # Prompt Templates
@@ -301,6 +301,65 @@ Return a revised candidate as JSON with these extra fields:
 Return ONLY the JSON, no additional text."""
 
 
+LANDSCAPE_MAP_PROMPT = """You are a research landscape analyst. Given a set of papers related to a research topic, construct a structured literature map that categorizes the research landscape.
+
+## Research Topic
+{topic}
+
+## Papers Found ({num_papers} total)
+{papers_text}
+
+## Task
+Analyze these papers and construct a literature map. Group papers into 3-6 thematic categories that represent distinct research directions or approaches within this topic.
+
+For EACH category, provide:
+- name: Short category name (2-5 words)
+- description: One-sentence description of this research direction
+- representative_papers: List of 2-4 paper titles that best represent this direction (cite titles exactly as given)
+- main_problems: 1-2 main research problems this direction addresses
+- typical_methods: 1-2 typical methods/approaches used
+- covered_gaps: What aspects of the topic this direction covers well
+- limitations: 1-2 explicit limitations or weaknesses of this direction
+- exploration_opportunities: 1-2 specific opportunities for further research or unexplored sub-problems
+
+Also provide an overall summary:
+- total_papers_analyzed: number of papers
+- categories_count: number of categories
+- overall_trends: 2-3 sentences on major trends observed
+- key_gaps: 2-3 specific research gaps that cut across categories
+- recommended_exploration: 2-3 specific directions worth exploring that are underrepresented
+
+## Output Format
+Return a JSON object with this structure:
+{{
+  "categories": [
+    {{
+      "name": "...",
+      "description": "...",
+      "representative_papers": ["title1", "title2"],
+      "main_problems": ["..."],
+      "typical_methods": ["..."],
+      "covered_gaps": ["..."],
+      "limitations": ["..."],
+      "exploration_opportunities": ["..."]
+    }}
+  ],
+  "summary": {{
+    "total_papers_analyzed": ...,
+    "categories_count": ...,
+    "overall_trends": "...",
+    "key_gaps": ["...", "..."],
+    "recommended_exploration": ["...", "..."]
+  }}
+}}
+
+Return ONLY the JSON object, no additional text."""
+
+
+# Pre-compiled patterns used across multiple functions
+_TITLE_KEY_RE = re.compile(r"[^a-z0-9]")
+
+
 # =============================================================================
 # Utility Functions
 # =============================================================================
@@ -442,6 +501,91 @@ def _normalize_candidate(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _candidate_signature(candidate: dict[str, Any]) -> str:
+    """Build a compact text signature for similarity checks."""
+    keywords = candidate.get("keywords", [])
+    if isinstance(keywords, list):
+        keywords_text = " ".join(str(k) for k in keywords)
+    else:
+        keywords_text = str(keywords)
+    parts = [
+        candidate.get("title", ""),
+        candidate.get("problem", ""),
+        candidate.get("idea", ""),
+        candidate.get("key_difference", ""),
+        keywords_text,
+    ]
+    return " ".join(str(p) for p in parts if p).strip().lower()
+
+
+def _tokenize_signature(signature: str) -> set[str]:
+    """Tokenize a candidate signature for coarse Jaccard similarity."""
+    text = re.sub(r"\s+", "", signature.lower())
+    tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", text)
+    tokens_set = {tok for tok in tokens if len(tok.strip()) > 1}
+
+    # Add character bigrams so short Chinese phrases still register as similar.
+    for i in range(max(0, len(text) - 1)):
+        gram = text[i:i + 2]
+        if len(gram.strip()) > 1:
+            tokens_set.add(gram)
+
+    return tokens_set
+
+
+def _candidate_similarity(candidate_a: dict[str, Any], candidate_b: dict[str, Any]) -> float:
+    """Compute a coarse lexical similarity score between two candidates."""
+    title_a = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(candidate_a.get("title", "")).lower())
+    title_b = re.sub(r"[^\w\u4e00-\u9fff]+", "", str(candidate_b.get("title", "")).lower())
+    if title_a and title_b and (title_a in title_b or title_b in title_a):
+        return 1.0
+
+    tokens_a = _tokenize_signature(_candidate_signature(candidate_a))
+    tokens_b = _tokenize_signature(_candidate_signature(candidate_b))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    overlap = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    return overlap / union if union else 0.0
+
+
+def _filter_diverse_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    similarity_threshold: float = 0.58,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Remove near-duplicate candidates while preserving the first occurrence."""
+    unique: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for candidate in candidates:
+        if any(_candidate_similarity(candidate, existing) >= similarity_threshold for existing in unique):
+            rejected.append(candidate)
+        else:
+            unique.append(candidate)
+
+    return unique, rejected
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    """Safely parse a boolean value from various types.
+
+    Handles: bool, int (0/1), str ("true"/"false", "yes"/"no", "1"/"0", etc.).
+    Python's bool() on non-empty strings always returns True, so this is needed.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "yes", "1", "on"):
+            return True
+        if lowered in ("false", "no", "0", "off", ""):
+            return False
+    return default
+
+
 def _normalize_analysis(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalize a novelty analysis result to standard schema.
 
@@ -463,8 +607,8 @@ def _normalize_analysis(raw: dict[str, Any]) -> dict[str, Any]:
         "overlap_with_papers": _ensure_list(raw.get("overlap_with_papers", [])),
         "similarities": _ensure_list(raw.get("similarities", [])),
         "differences": _ensure_list(raw.get("differences", [])),
-        "is_duplicate": bool(raw.get("is_duplicate", False)),
-        "is_highly_similar": bool(raw.get("is_highly_similar", False)),
+        "is_duplicate": _parse_bool(raw.get("is_duplicate"), False),
+        "is_highly_similar": _parse_bool(raw.get("is_highly_similar"), False),
         "novelty_level": novelty_level,
         "novelty_conclusion": str(raw.get("novelty_conclusion", "")),
         "gaps_addressed": _ensure_list(raw.get("gaps_addressed", [])),
@@ -549,6 +693,17 @@ def _workflow_info() -> dict[str, Any]:
         "topic_slug": None,
         "params": {},
         "stages": {
+            "stage0_landscape": {
+                "status": "pending",
+                "started_at": None,
+                "completed_at": None,
+                "input_params": {},
+                "output_files": {},
+                "num_local_papers": 0,
+                "num_online_papers": 0,
+                "num_categories": 0,
+                "error": None,
+            },
             "stage1_generate": {
                 "status": "pending",
                 "started_at": None,
@@ -694,7 +849,8 @@ class InnovationWorkflowTool(Tool):
         "Generate innovation point candidates from a research topic, perform novelty search, "
         "and review/score candidates. Takes a topic/problem, generates candidates, searches "
         "for related work, assesses novelty, reviews/scores each candidate, and optionally "
-        "iterates on revise candidates across multiple rounds. "
+        "iterates on revise candidates across multiple rounds. Use overwrite=True when you want "
+        "a fresh batch instead of reusing cached results. "
         "Outputs to innovation/<topic>/ directory."
     )
 
@@ -772,6 +928,18 @@ class InnovationWorkflowTool(Tool):
                 "type": "boolean",
                 "description": "Stop if no new proceed candidates in a round (default: true)",
                 "default": True,
+            },
+            "enable_landscape": {
+                "type": "boolean",
+                "description": "Enable landscape survey stage before candidate generation: local scan + multi-source search + literature map (default: false)",
+                "default": False,
+            },
+            "landscape_max_online": {
+                "type": "integer",
+                "description": "Max papers per online source (arXiv/Crossref/OpenAlex) during landscape survey (default: 8)",
+                "minimum": 1,
+                "maximum": 30,
+                "default": 8,
             },
         },
         "required": ["topic"],
@@ -852,7 +1020,35 @@ class InnovationWorkflowTool(Tool):
         query: str,
         max_papers: int = 5,
     ) -> list[dict[str, Any]]:
-        """Find most relevant papers for a query using semantic index if available."""
+        """Find most relevant papers for a query using keyword fallback only.
+
+        For async contexts, use _find_relevant_papers_async() instead which
+        properly handles the semantic search index.
+        """
+        all_papers = self._load_local_papers()
+        if not all_papers:
+            return []
+
+        # Fallback: keyword-based relevance scoring
+        scored = []
+        for paper in all_papers:
+            score = self._score_paper_relevance(paper, query)
+            if score > 0:
+                scored.append((score, paper))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [p for s, p in scored[:max_papers] if s > 0]
+
+    async def _find_relevant_papers_async(
+        self,
+        query: str,
+        max_papers: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Find most relevant papers for a query using semantic index if available.
+
+        Works correctly in async contexts. Falls back to keyword scoring if
+        the semantic index is unavailable or errors out.
+        """
         all_papers = self._load_local_papers()
         if not all_papers:
             return []
@@ -861,29 +1057,24 @@ class InnovationWorkflowTool(Tool):
         search_index = self._get_search_index()
         if search_index is not None:
             try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    loop.run_until_complete(search_index.initialize())
-                    results = loop.run_until_complete(
-                        search_index.search(query, top_k=max_papers, rerank=False)
-                    )
-                    search_index.close()
-                    if results:
-                        papers = []
-                        seen_ids = set()
-                        for r in results:
-                            paper_id = r.get("paper_id")
-                            if paper_id and paper_id not in seen_ids:
-                                seen_ids.add(paper_id)
-                                paper = next(
-                                    (p for p in all_papers if p.get("paper_id") == paper_id),
-                                    None,
-                                )
-                                if paper:
-                                    papers.append(paper)
-                        if papers:
-                            return papers
+                await search_index.initialize()
+                results = await search_index.search(query, top_k=max_papers, rerank=False)
+                search_index.close()
+                if results:
+                    papers = []
+                    seen_ids = set()
+                    for r in results:
+                        paper_id = r.get("paper_id")
+                        if paper_id and paper_id not in seen_ids:
+                            seen_ids.add(paper_id)
+                            paper = next(
+                                (p for p in all_papers if p.get("paper_id") == paper_id),
+                                None,
+                            )
+                            if paper:
+                                papers.append(paper)
+                    if papers:
+                        return papers
             except Exception:
                 pass
 
@@ -934,6 +1125,447 @@ class InnovationWorkflowTool(Tool):
         except Exception:
             return []
 
+    async def _search_crossref(self, query: str, max_results: int = 8) -> list[dict[str, Any]]:
+        """Search Crossref for papers."""
+        try:
+            from researchbot.agent.tools.crossref_client import search_crossref, DEFAULT_TIMEOUT
+            works = await search_crossref(
+                query=query,
+                max_results=max_results,
+                timeout=DEFAULT_TIMEOUT,
+                proxy=self._proxy,
+            )
+            papers = []
+            for w in works:
+                papers.append({
+                    "paper_id": w.doi or "",
+                    "title": w.title,
+                    "authors": w.authors,
+                    "abstract": w.abstract,
+                    "year": w.year,
+                    "published": w.year,
+                    "source": "crossref",
+                    "external_ids": {"doi": w.doi} if w.doi else {},
+                    "journal": w.journal,
+                    "cited_by_count": w.cited_by_count,
+                    "url": w.url,
+                })
+            return papers
+        except Exception:
+            return []
+
+    async def _search_openalex(self, query: str, max_results: int = 8) -> list[dict[str, Any]]:
+        """Search OpenAlex for papers."""
+        try:
+            from researchbot.agent.tools.openalex_client import search_openalex, DEFAULT_TIMEOUT
+            works = await search_openalex(
+                query=query,
+                max_results=max_results,
+                timeout=DEFAULT_TIMEOUT,
+                proxy=self._proxy,
+            )
+            papers = []
+            for w in works:
+                papers.append({
+                    "paper_id": w.id or w.doi or "",
+                    "title": w.title,
+                    "authors": w.authors,
+                    "abstract": w.abstract,
+                    "year": w.year,
+                    "published": w.year,
+                    "source": "openalex",
+                    "external_ids": {"doi": w.doi, "openalex": w.id} if w.doi else {"openalex": w.id},
+                    "journal": w.journal,
+                    "cited_by_count": w.cited_by_count,
+                    "url": w.url,
+                })
+            return papers
+        except Exception:
+            return []
+
+    async def _search_multi_source(
+        self,
+        topic: str,
+        max_per_source: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Search multiple academic sources and merge results, deduplicating by title similarity."""
+        all_papers: list[dict[str, Any]] = []
+        seen_titles: set[str] = set()
+
+        def _add_papers(papers: list[dict[str, Any]]):
+            for p in papers:
+                key = _TITLE_KEY_RE.sub("", p.get("title", "").lower())[:80]
+                if key and key not in seen_titles:
+                    seen_titles.add(key)
+                    all_papers.append(p)
+
+        # Run all three searches concurrently
+        import asyncio
+        results = await asyncio.gather(
+            self._search_arxiv(topic, max_per_source),
+            self._search_crossref(topic, max_per_source),
+            self._search_openalex(topic, max_per_source),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, list):
+                _add_papers(r)
+
+        return all_papers
+
+    async def _build_literature_map(
+        self,
+        topic: str,
+        papers: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Categorize papers into a literature map using LLM."""
+        if not self._provider or not papers:
+            return None
+
+        # Format papers for the prompt
+        paper_lines = []
+        for i, p in enumerate(papers[:40], 1):
+            title = p.get("title", "?")
+            year = p.get("year", "") or p.get("published", "")[:4]
+            source = p.get("source", "")
+            authors = p.get("authors", [])
+            authors_str = ", ".join(authors[:2]) if authors else "Unknown"
+            if len(authors) > 2:
+                authors_str += " et al."
+            abstract = p.get("abstract", "")
+            if isinstance(abstract, dict):
+                abstract = str(abstract)[:200]
+            else:
+                abstract = str(abstract)[:200]
+            paper_lines.append(f"[{i}] ({source}, {year}) {title} - {authors_str}\n    Abstract: {abstract}")
+
+        papers_text = "\n".join(paper_lines)
+
+        prompt = LANDSCAPE_MAP_PROMPT.format(
+            topic=topic,
+            num_papers=len(papers),
+            papers_text=papers_text,
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+
+        for attempt in range(2):
+            try:
+                response = await self._provider.chat_with_retry(messages)
+                content = response.content or ""
+                result = _parse_json_robust(content, expect_array=False)
+                if result is not None and isinstance(result, dict):
+                    if "categories" in result and "summary" in result:
+                        return result
+
+                if attempt == 0 and content:
+                    clarification = (
+                        "\n\nNote: The above output was not valid JSON. "
+                        "Please provide ONLY the JSON object with no other text."
+                    )
+                    messages = [{"role": "user", "content": prompt + clarification}]
+                    continue
+            except Exception:
+                if attempt == 0:
+                    continue
+                pass
+
+        return None
+
+    def _save_landscape_report(
+        self,
+        topic: str,
+        local_papers: list[dict[str, Any]],
+        online_papers: list[dict[str, Any]],
+        all_papers: list[dict[str, Any]],
+        literature_map: dict[str, Any] | None,
+        search_local: bool = True,
+        max_online: int = 8,
+    ) -> tuple[str, str]:
+        """Save landscape report to JSON and markdown files."""
+        slug = _slugify(topic)
+        innovation_dir = self._resolve_path(f"innovation/{slug}")
+        innovation_dir.mkdir(parents=True, exist_ok=True)
+
+        now = utc_now()
+
+        # Build JSON report
+        report_data: dict[str, Any] = {
+            "topic": topic,
+            "topic_slug": slug,
+            "generated_at": now,
+            "params": {
+                "search_local": search_local,
+                "max_online": max_online,
+            },
+            "local_papers_count": len(local_papers),
+            "online_papers_count": len(online_papers),
+            "total_papers_count": len(all_papers),
+            "local_papers": [
+                {
+                    "paper_id": p.get("paper_id", ""),
+                    "title": p.get("title", ""),
+                    "year": p.get("year", ""),
+                    "source": p.get("source", "local"),
+                }
+                for p in local_papers
+            ],
+            "online_papers": [
+                {
+                    "paper_id": p.get("paper_id", ""),
+                    "title": p.get("title", ""),
+                    "year": p.get("year", ""),
+                    "source": p.get("source", ""),
+                    "cited_by_count": p.get("cited_by_count", 0),
+                }
+                for p in online_papers
+            ],
+        }
+
+        if literature_map:
+            report_data["literature_map"] = literature_map
+
+        json_path = innovation_dir / "landscape_report.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+
+        # Build markdown report
+        md_lines = [
+            f"# Landscape Survey: {topic}\n",
+            f"\n**Generated**: {now}\n",
+            f"\n**Papers Found**: {len(all_papers)} total "
+            f"({len(local_papers)} local, {len(online_papers)} online)\n",
+        ]
+
+        if local_papers:
+            md_lines.append("\n## Local Papers\n")
+            for p in local_papers:
+                md_lines.append(
+                    f"- {p.get('title', '?')} ({p.get('year', '?')})\n"
+                )
+
+        if online_papers:
+            md_lines.append("\n## Online Papers\n")
+            by_source: dict[str, list[dict]] = {}
+            for p in online_papers:
+                src = p.get("source", "unknown")
+                by_source.setdefault(src, []).append(p)
+            for src, papers in by_source.items():
+                md_lines.append(f"\n### {src.title()}\n")
+                for p in papers:
+                    title = p.get("title", "?")
+                    year = p.get("year", "?")
+                    cited = p.get("cited_by_count", 0)
+                    cite_str = f" (cited: {cited})" if cited else ""
+                    md_lines.append(f"- {title} ({year}){cite_str}\n")
+
+        if literature_map:
+            categories = literature_map.get("categories", [])
+            summary = literature_map.get("summary", {})
+
+            md_lines.append(f"\n## Literature Map ({len(categories)} categories)\n")
+
+            if summary.get("overall_trends"):
+                md_lines.append(f"\n**Overall Trends**: {summary['overall_trends']}\n")
+
+            for i, cat in enumerate(categories, 1):
+                md_lines.append(f"\n### {i}. {cat.get('name', 'Unnamed')}\n")
+                md_lines.append(f"{cat.get('description', '')}\n")
+
+                reps = cat.get("representative_papers", [])
+                if reps:
+                    md_lines.append("\n**Representative Papers**:\n")
+                    for r in reps:
+                        md_lines.append(f"- {r}\n")
+
+                problems = cat.get("main_problems", [])
+                if problems:
+                    md_lines.append(f"\n**Main Problems**: {'; '.join(problems)}\n")
+
+                methods = cat.get("typical_methods", [])
+                if methods:
+                    md_lines.append(f"\n**Typical Methods**: {'; '.join(methods)}\n")
+
+                gaps = cat.get("covered_gaps", [])
+                if gaps:
+                    md_lines.append(f"\n**Covered Gaps**: {'; '.join(gaps)}\n")
+
+                limits = cat.get("limitations", [])
+                if limits:
+                    md_lines.append(f"\n**Limitations**: {'; '.join(limits)}\n")
+
+                opps = cat.get("exploration_opportunities", [])
+                if opps:
+                    md_lines.append(f"\n**Exploration Opportunities**: {'; '.join(opps)}\n")
+
+            if summary.get("key_gaps"):
+                md_lines.append("\n## Key Gaps Across Categories\n")
+                for g in summary["key_gaps"]:
+                    md_lines.append(f"- {g}\n")
+
+            if summary.get("recommended_exploration"):
+                md_lines.append("\n## Recommended Exploration\n")
+                for r in summary["recommended_exploration"]:
+                    md_lines.append(f"- {r}\n")
+
+        md_path = innovation_dir / "landscape_report.md"
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.writelines(md_lines)
+
+        return str(json_path), str(md_path)
+
+    def _format_landscape_context(
+        self,
+        literature_map: dict[str, Any] | None,
+        all_papers: list[dict[str, Any]],
+    ) -> str:
+        """Format landscape survey results as context for candidate generation."""
+        if not literature_map:
+            # Fallback: just list paper titles and abstracts
+            parts = []
+            for p in all_papers[:10]:
+                title = p.get("title", "?")
+                abstract = str(p.get("abstract", ""))[:150]
+                parts.append(f"- {title}: {abstract}")
+            return "\n".join(parts) if parts else ""
+
+        parts = []
+        categories = literature_map.get("categories", [])
+        summary = literature_map.get("summary", {})
+
+        if summary.get("overall_trends"):
+            parts.append(f"Overall trends: {summary['overall_trends']}")
+
+        for cat in categories:
+            name = cat.get("name", "Unnamed")
+            desc = cat.get("description", "")
+            problems = "; ".join(cat.get("main_problems", []))
+            limits = "; ".join(cat.get("limitations", []))
+            opps = "; ".join(cat.get("exploration_opportunities", []))
+            line = f"- [{name}] {desc}"
+            if problems:
+                line += f" Problems: {problems}"
+            if limits:
+                line += f" Limitations: {limits}"
+            if opps:
+                line += f" Opportunities: {opps}"
+            parts.append(line)
+
+        if summary.get("key_gaps"):
+            parts.append(f"Key gaps: {'; '.join(summary['key_gaps'])}")
+
+        return "\n".join(parts)
+
+    async def _run_landscape_survey(
+        self,
+        topic: str,
+        output_dir: Path,
+        metadata: dict[str, Any],
+        search_local: bool = True,
+        max_online: int = 8,
+        overwrite: bool = False,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Run landscape survey: local scan + multi-source search + literature map.
+
+        Returns (all_papers, context_string) for use in candidate generation.
+        """
+        landscape_json_path = str(output_dir / "landscape_report.json")
+        landscape_md_path = str(output_dir / "landscape_report.md")
+        landscape_exists = (output_dir / "landscape_report.json").exists()
+
+        if landscape_exists and not overwrite:
+            with open(output_dir / "landscape_report.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Validate that cached params match current params
+            cached_params = data.get("params", {})
+            current_params = {"search_local": search_local, "max_online": max_online}
+            if cached_params != current_params:
+                # Params changed, discard stale cache
+                landscape_exists = False
+                landscape_json_path = None
+            else:
+                local_papers = data.get("local_papers", [])
+                online_papers = data.get("online_papers", [])
+                all_papers = local_papers + online_papers
+                literature_map = data.get("literature_map")
+
+                now = utc_now()
+                metadata["stages"]["stage0_landscape"].update({
+                    "status": "skipped",
+                    "started_at": now,
+                    "completed_at": now,
+                    "output_files": {
+                        "landscape_json": landscape_json_path,
+                        "landscape_md": landscape_md_path,
+                    },
+                    "num_local_papers": len(local_papers),
+                    "num_online_papers": len(online_papers),
+                    "num_categories": len(literature_map.get("categories", [])) if literature_map else 0,
+                    "note": "Reused existing file",
+                })
+
+                context = self._format_landscape_context(literature_map, all_papers)
+                return all_papers, context
+
+        # Run the landscape survey
+        metadata["stages"]["stage0_landscape"]["status"] = "running"
+        metadata["stages"]["stage0_landscape"]["started_at"] = utc_now()
+        metadata["stages"]["stage0_landscape"]["input_params"] = {
+            "search_local": search_local,
+            "max_online": max_online,
+        }
+        _save_workflow_metadata(metadata, self._workspace, topic)
+
+        # Step 1: Local scan
+        local_papers: list[dict[str, Any]] = []
+        if search_local:
+            local_papers = await self._find_relevant_papers_async(topic, max_papers=15)
+
+        # Step 2: Multi-source online search
+        online_papers = await self._search_multi_source(topic, max_per_source=max_online)
+
+        # Deduplicate: combine and remove duplicates by title
+        seen: set[str] = set()
+        all_papers: list[dict[str, Any]] = []
+
+        for p in local_papers:
+            key = _TITLE_KEY_RE.sub("", p.get("title", "").lower())[:80]
+            if key and key not in seen:
+                seen.add(key)
+                all_papers.append(p)
+
+        for p in online_papers:
+            key = _TITLE_KEY_RE.sub("", p.get("title", "").lower())[:80]
+            if key and key not in seen:
+                seen.add(key)
+                all_papers.append(p)
+
+        # Step 3: Build literature map
+        literature_map = await self._build_literature_map(topic, all_papers)
+
+        # Save report
+        json_path, md_path = self._save_landscape_report(
+            topic, local_papers, online_papers, all_papers, literature_map,
+            search_local=search_local, max_online=max_online,
+        )
+
+        metadata["stages"]["stage0_landscape"]["status"] = "completed"
+        metadata["stages"]["stage0_landscape"]["completed_at"] = utc_now()
+        metadata["stages"]["stage0_landscape"]["output_files"] = {
+            "landscape_json": json_path,
+            "landscape_md": md_path,
+        }
+        metadata["stages"]["stage0_landscape"]["num_local_papers"] = len(local_papers)
+        metadata["stages"]["stage0_landscape"]["num_online_papers"] = len(online_papers)
+        metadata["stages"]["stage0_landscape"]["num_categories"] = (
+            len(literature_map.get("categories", [])) if literature_map else 0
+        )
+        _save_workflow_metadata(metadata, self._workspace, topic)
+
+        context = self._format_landscape_context(literature_map, all_papers)
+        return all_papers, context
+
     async def _generate_candidates(
         self,
         topic: str,
@@ -952,6 +1584,18 @@ class InnovationWorkflowTool(Tool):
             "Generate 3-8 candidate innovation points.",
             f"Generate exactly {num_candidates} candidate innovation points.",
         )
+        diversity_plan = (
+            "Diversity plan: make each candidate clearly different in angle, not just wording. "
+            "Use concrete mechanisms and specific sub-problems instead of broad umbrella statements."
+        )
+        if num_candidates >= 4:
+            diversity_plan += (
+                " Try to cover problem definition, method improvement, system/setting, and "
+                "experimental/tooling angles at least once."
+            )
+        elif num_candidates == 3:
+            diversity_plan += " Prefer three different innovation levels."
+        prompt = f"{prompt}\n\n{diversity_plan}"
 
         messages = [{"role": "user", "content": prompt}]
 
@@ -963,13 +1607,33 @@ class InnovationWorkflowTool(Tool):
                 result = _parse_json_robust(content, expect_array=True)
                 if result is not None and isinstance(result, list) and len(result) > 0:
                     normalized = [_normalize_candidate(c) for c in result]
-                    return normalized
+                    diverse, rejected = _filter_diverse_candidates(normalized)
+                    if len(diverse) >= num_candidates:
+                        return diverse[:num_candidates]
+
+                    if attempt == 0 and rejected:
+                        rejected_json = json.dumps(rejected[:num_candidates], ensure_ascii=False, indent=2)
+                        kept_json = json.dumps(diverse[:num_candidates], ensure_ascii=False, indent=2)
+                        regeneration_hint = (
+                            "\n\nImportant: Several candidates above were too similar. "
+                            f"Regenerate the full JSON array with exactly {num_candidates} candidates. "
+                            "Keep the good diversity of the remaining ideas, but replace the rejected ones with "
+                            "clearly different angles and different innovation levels when possible. "
+                            "Do not reuse, paraphrase, or slightly rename the rejected candidates.\n\n"
+                            f"Rejected candidates:\n{rejected_json}\n\n"
+                            f"Acceptable candidates to stay different from:\n{kept_json}\n"
+                        )
+                        messages = [{"role": "user", "content": prompt + regeneration_hint}]
+                        continue
+
+                    return diverse if diverse else normalized[:num_candidates]
 
                 if attempt == 0 and content:
                     clarification = (
                         "\n\nNote: The above output was not valid JSON. "
                         "Please regenerate with ONLY a JSON array of innovation points, "
-                        f"exactly {num_candidates} objects, with no other text."
+                        f"exactly {num_candidates} objects, with no other text. "
+                        "Make each candidate clearly different in innovation angle."
                     )
                     messages = [{"role": "user", "content": prompt + clarification}]
                     continue
@@ -1494,6 +2158,7 @@ class InnovationWorkflowTool(Tool):
         search_online: bool,
         max_related: int,
         round_num: int,
+        enable_review: bool = True,
     ) -> list[dict[str, Any]]:
         """Run novelty search and review for a batch of candidates in one iteration round."""
         results = []
@@ -1507,7 +2172,7 @@ class InnovationWorkflowTool(Tool):
 
             if search_local and keywords:
                 query = " ".join(keywords)
-                local_results = self._find_relevant_papers(query, max_papers=max_related)
+                local_results = await self._find_relevant_papers_async(query, max_papers=max_related)
                 related_papers.extend(local_results)
 
             if search_online and keywords:
@@ -1540,8 +2205,14 @@ class InnovationWorkflowTool(Tool):
             # Novelty analysis
             analysis = await self._analyze_novelty(candidate, full_related_papers)
 
-            # Review
-            review = await self._review_candidate(candidate, analysis, full_related_papers)
+            # Review (skip LLM call when disabled)
+            if enable_review:
+                review = await self._review_candidate(candidate, analysis, full_related_papers)
+            else:
+                review = _normalize_review({
+                    "reasoning": "Review skipped (enable_review=False)",
+                    "decision": "revise",
+                })
 
             results.append({
                 "candidate": candidate,
@@ -1736,10 +2407,82 @@ class InnovationWorkflowTool(Tool):
         min_proceed: int,
         revise_top_k: int,
         stop_if_no_change: bool,
+        landscape_context: str = "",
     ) -> str:
         """Run multi-round iterative workflow."""
-        now = utc_now()
         innovation_dir = output_dir
+
+        # If workflow already completed and overwrite=False, return cached results directly
+        # This makes repeated identical calls idempotent
+        if not overwrite:
+            workflow_file = innovation_dir / "workflow.json"
+            if workflow_file.exists():
+                try:
+                    cached = json.loads(workflow_file.read_text(encoding="utf-8"))
+                    if cached.get("overall_status") == "completed":
+                        iteration_data = cached.get("iteration", {})
+                        rounds_completed = iteration_data.get("rounds_completed", 0)
+                        stopping_reason = iteration_data.get("stopping_reason", "cached")
+                        # Load existing reports
+                        iteration_json = innovation_dir / "iteration_report.json"
+                        iteration_md = innovation_dir / "iteration_report.md"
+                        # Load rounds data from per-round review files
+                        rounds_data: list[dict[str, Any]] = []
+                        all_proceed_candidates: list[dict[str, Any]] = []
+                        if (innovation_dir / "iterations").exists():
+                            for round_dir in sorted((innovation_dir / "iterations").iterdir()):
+                                if round_dir.is_dir() and round_dir.name.startswith("round_"):
+                                    review_file = round_dir / "review_report.json"
+                                    if review_file.exists():
+                                        rd = json.loads(review_file.read_text(encoding="utf-8"))
+                                        results = rd.get("results", [])
+                                        rounds_data.append({
+                                            "round": rd.get("round", 0),
+                                            "status": "completed",
+                                            "completed_at": rd.get("generated_at", ""),
+                                            "results": results,
+                                            "counts": rd.get("summary", {}),
+                                        })
+                                        # Collect all proceed candidates
+                                        for r in results:
+                                            if r.get("review", {}).get("decision", "").lower() == "proceed":
+                                                all_proceed_candidates.append(r)
+                        # Reconstruct top candidates
+                        lineage_map: dict[str, dict[str, Any]] = {}
+                        for cand in all_proceed_candidates:
+                            c = cand.get("candidate", {})
+                            lineage_key = c.get("parent_candidate") or c.get("title", "")
+                            if not lineage_key:
+                                continue
+                            score = cand.get("review", {}).get("overall_score", 0)
+                            existing = lineage_map.get(lineage_key)
+                            if existing is None:
+                                lineage_map[lineage_key] = cand
+                            else:
+                                existing_score = existing.get("review", {}).get("overall_score", 0)
+                                existing_round = existing.get("candidate", {}).get("revision_round", 0)
+                                cand_round = c.get("revision_round", 0)
+                                if (score > existing_score) or (
+                                    score == existing_score and cand_round > existing_round
+                                ):
+                                    lineage_map[lineage_key] = cand
+                        final_sorted = sorted(
+                            lineage_map.values(),
+                            key=lambda x: (
+                                x.get("review", {}).get("overall_score", 0),
+                                x.get("candidate", {}).get("revision_round", 0),
+                            ),
+                            reverse=True,
+                        )[:top_k]
+                        return self._build_iteration_output(
+                            topic, rounds_data, final_sorted,
+                            stopping_reason, innovation_dir,
+                            str(iteration_json), str(iteration_md),
+                        )
+                except Exception:
+                    pass  # Fall through to re-run if cache read fails
+
+        now = utc_now()
 
         # Update workflow metadata with iteration info
         metadata["iteration"] = {
@@ -1840,10 +2583,15 @@ class InnovationWorkflowTool(Tool):
         # Round 0: Generate initial candidates + novelty + review
         # =====================================================================
         context = ""
+        if landscape_context:
+            context = f"## Landscape Survey Results\n{landscape_context}\n"
         if search_local:
-            relevant_papers = self._find_relevant_papers(topic, max_papers=5)
+            relevant_papers = await self._find_relevant_papers_async(topic, max_papers=5)
             if relevant_papers:
                 context_parts = []
+                if context:
+                    context_parts.append(context)
+                    context_parts.append("\n## Key Local Papers\n")
                 for p in relevant_papers:
                     title = p.get("title", "?")
                     summary = p.get("summary", {})
@@ -1904,6 +2652,7 @@ class InnovationWorkflowTool(Tool):
         # Run novelty + review on round 0
         round0_results = await self._run_iteration_round(
             topic, initial_candidates, search_local, search_online, max_related, round_num=0,
+            enable_review=enable_review,
         )
 
         metadata["stages"]["stage2_novelty"]["status"] = "completed"
@@ -2015,6 +2764,7 @@ class InnovationWorkflowTool(Tool):
             # Run novelty + review on revised candidates
             round_results = await self._run_iteration_round(
                 topic, revised_candidates, search_local, search_online, max_related, round_num,
+                enable_review=enable_review,
             )
 
             proceed_n, revise_n, drop_n = _classify_candidates(round_results)
@@ -2034,9 +2784,9 @@ class InnovationWorkflowTool(Tool):
             metadata["iteration"]["rounds_completed"] = len(rounds_data)
             _save_workflow_metadata(metadata, self._workspace, topic)
 
-            # Check stop conditions
-            if len(proceed_n) >= min_proceed:
-                stopping_reason = f"Round {round_num}: found {len(proceed_n)} proceed candidates (min_proceed={min_proceed})"
+            # Check stop conditions (cumulative proceed count)
+            if len(all_proceed_candidates) >= min_proceed:
+                stopping_reason = f"Round {round_num}: cumulative {len(all_proceed_candidates)} proceed candidates (min_proceed={min_proceed})"
                 _finalize_iteration_stages(stopping_reason)
                 _save_workflow_metadata(metadata, self._workspace, topic)
                 break
@@ -2128,6 +2878,7 @@ class InnovationWorkflowTool(Tool):
         return "".join(output_parts)
 
     async def execute(
+        self,
         search_online: bool = True,
         max_related: int = 5,
         enable_review: bool = True,
@@ -2138,8 +2889,13 @@ class InnovationWorkflowTool(Tool):
         min_proceed: int = 1,
         revise_top_k: int = 3,
         stop_if_no_change: bool = True,
+        enable_landscape: bool = False,
+        landscape_max_online: int = 8,
         **kwargs: Any,
     ) -> str:
+        topic = kwargs.get("topic")
+        num_candidates = kwargs.get("num_candidates", 5)
+        search_local = kwargs.get("search_local", True)
         if not topic:
             return "Error: topic is required"
 
@@ -2166,8 +2922,22 @@ class InnovationWorkflowTool(Tool):
             "enable_review": enable_review,
             "top_k": top_k,
             "overwrite": overwrite,
+            "enable_landscape": enable_landscape,
+            "landscape_max_online": landscape_max_online,
         }
         metadata["params"].update(iteration_params)
+
+        # =====================================================================
+        # Stage 0: Landscape survey (optional, before everything else)
+        # =====================================================================
+        landscape_context = ""
+        if enable_landscape:
+            _, landscape_context = await self._run_landscape_survey(
+                topic, output_dir, metadata,
+                search_local=search_local,
+                max_online=landscape_max_online,
+                overwrite=overwrite,
+            )
 
         # =====================================================================
         # Iteration mode: multi-round iterative workflow
@@ -2184,6 +2954,7 @@ class InnovationWorkflowTool(Tool):
                 search_local, search_online, max_related,
                 enable_review, top_k, overwrite,
                 max_rounds, min_proceed, revise_top_k, stop_if_no_change,
+                landscape_context=landscape_context,
             )
 
         # =====================================================================
@@ -2292,10 +3063,15 @@ class InnovationWorkflowTool(Tool):
             metadata["stages"]["stage1_generate"]["note"] = "Reused existing file"
         else:
             context = ""
+            if landscape_context:
+                context = f"## Landscape Survey Results\n{landscape_context}\n"
             if search_local:
-                relevant_papers = self._find_relevant_papers(topic, max_papers=5)
+                relevant_papers = await self._find_relevant_papers_async(topic, max_papers=5)
                 if relevant_papers:
                     context_parts = []
+                    if context:
+                        context_parts.append(context)
+                        context_parts.append("\n## Key Local Papers\n")
                     for p in relevant_papers:
                         title = p.get("title", "?")
                         summary = p.get("summary", {})
@@ -2371,7 +3147,7 @@ class InnovationWorkflowTool(Tool):
 
                 if search_local and keywords:
                     query = " ".join(keywords)
-                    local_results = self._find_relevant_papers(query, max_papers=max_related)
+                    local_results = await self._find_relevant_papers_async(query, max_papers=max_related)
                     related_papers.extend(local_results)
 
                 if search_online and keywords:
@@ -2513,11 +3289,20 @@ class InnovationWorkflowTool(Tool):
             f"\n**Stages**:\n",
             *stage_summaries,
             f"\n**Output Files**:\n",
+        ]
+
+        if enable_landscape:
+            landscape_json = str(output_dir / "landscape_report.json")
+            landscape_md = str(output_dir / "landscape_report.md")
+            output_parts.append(f"- Landscape Report JSON: {landscape_json}\n")
+            output_parts.append(f"- Landscape Report MD: {landscape_md}\n")
+
+        output_parts.extend([
             f"- Candidates JSON: {candidates_json_path}\n",
             f"- Candidates MD: {candidates_md_path}\n",
             f"- Novelty Report JSON: {novelty_json_path}\n",
             f"- Novelty Report MD: {novelty_md_path}\n",
-        ]
+        ])
 
         if enable_review:
             output_parts.append(f"- Review Report JSON: {review_json_path}\n")

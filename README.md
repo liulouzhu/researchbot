@@ -188,6 +188,8 @@ researchbot agent -m "innovation_workflow topic=\"LLM security\" enable_iteratio
 researchbot agent -m "innovation_workflow topic=\"LLM security\" overwrite=True"
 ```
 
+> 如果你想要的是“再来一批不一样的”，请明确传 `overwrite=True`。默认情况下同一主题会复用已有结果，避免重复计算。
+
 **四阶段工作流：**
 
 | 阶段 | 说明 |

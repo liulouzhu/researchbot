@@ -374,6 +374,48 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _message_content_to_text(content: Any) -> str:
+        """Flatten a message content payload into plain text for skill detection."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _infer_skill_names(self, history: list[dict[str, Any]], current_message: str) -> list[str]:
+        """Infer which skill docs should be loaded for the current turn."""
+        corpus_parts = [current_message]
+        for msg in history[-6:]:
+            corpus_parts.append(self._message_content_to_text(msg.get("content")))
+
+        corpus = "\n".join(part for part in corpus_parts if part).lower()
+        if not corpus:
+            return []
+
+        innovation_terms = (
+            "innovation_workflow",
+            "innovation workflow",
+            "innovative",
+            "创新点",
+            "创新点生成",
+            "创新点工作流",
+            "创新方向",
+            "查新",
+            "novelty search",
+        )
+        if any(term in corpus for term in innovation_terms):
+            return ["innovation"]
+        return []
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -555,10 +597,12 @@ class AgentLoop:
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
+            skill_names = self._infer_skill_names(history, msg.content)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
+                skill_names=skill_names,
                 current_role=current_role,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
@@ -591,11 +635,13 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
+        skill_names = self._infer_skill_names(history, msg.content)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            skill_names=skill_names,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -726,9 +772,50 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
+        # Pre-process tool-call-like syntax into natural language
+        content = self._preprocess_tool_syntax(content)
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         return await self._process_message(
             msg, session_key=session_key, on_progress=on_progress,
             on_stream=on_stream, on_stream_end=on_stream_end,
         )
+
+    @staticmethod
+    def _preprocess_tool_syntax(content: str) -> str:
+        """Convert tool-call-like syntax into natural language for the LLM."""
+        # Match patterns like: innovation_workflow topic="..." num_candidates=5
+        # or: paper_search query="..." max_results=10
+        tool_call_pattern = r'^(\w+)\s+(topic|query|message)=["\']([^"\']+)["\']?\s*(.*)?$'
+        match = re.match(tool_call_pattern, content.strip(), re.IGNORECASE)
+        if match:
+            tool_name = match.group(1)
+            primary_arg = match.group(2)
+            primary_value = match.group(3)
+            extra_args = match.group(4) or ""
+
+            # Map tool names to natural language
+            if tool_name == "innovation_workflow":
+                # Parse extra arguments
+                params = {}
+                if extra_args:
+                    for param in re.finditer(r'(\w+)=([^\s]+)', extra_args):
+                        params[param.group(1)] = param.group(2).strip('"\'')
+                num = params.get('num_candidates', '5')
+                rounds = params.get('max_rounds', '')
+                iteration = params.get('enable_iteration', '')
+
+                parts = [f"使用innovation_workflow生成{num}个关于{primary_value}的创新点"]
+                if iteration.lower() == 'true' if isinstance(iteration, str) else iteration:
+                    parts.append(f"迭代{rounds or '多'}轮")
+                return "".join(parts)
+
+            elif tool_name == "paper_search":
+                params = {}
+                if extra_args:
+                    for param in re.finditer(r'(\w+)=([^\s]+)', extra_args):
+                        params[param.group(1)] = param.group(2).strip('"\'')
+                max_results = params.get('max_results', '10')
+                return f"搜索论文，关键词是{primary_value}，最多返回{max_results}个结果"
+
+        return content

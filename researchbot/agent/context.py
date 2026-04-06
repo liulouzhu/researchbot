@@ -43,6 +43,11 @@ class ContextBuilder:
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
+        if skill_names:
+            requested_content = self.skills.load_skills_for_context(skill_names)
+            if requested_content:
+                parts.append(f"# Requested Skills\n\n{requested_content}")
+
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
             parts.append(f"""# Skills

@@ -50,7 +50,10 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        return (
+            "Execute a shell command and return its output. "
+            "Use only when no dedicated tool exists for the task, and use with caution."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
