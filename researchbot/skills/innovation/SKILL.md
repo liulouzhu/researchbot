@@ -6,7 +6,9 @@ metadata: {"researchbot":{"emoji":"💡"}}
 
 # Innovation Workflow
 
-> **⚠️ CRITICAL: When user asks for innovation points, ALWAYS call the `innovation_workflow` tool directly. NEVER use `exec` to import or run Python modules. When user says "再换几个", "别的", "再帮我想", "重新生成", or "different/another batch" → you MUST pass `overwrite=True` to the tool.**
+> **⚠️ CRITICAL: When user asks for innovation points, ALWAYS call the `innovation_workflow` tool directly. NEVER use `exec` to import or run Python modules. When user says "再换一个", "换一个", "再换几个", "别的", "再帮我想", "重新生成", or "different/another batch" → you MUST pass `overwrite=True` to the tool.**
+>
+> **Do not use exec for this workflow when innovation_workflow is available.**
 
 Generate and evaluate innovation point candidates for research topics. This workflow helps identify novel research directions through these stages:
 
@@ -36,7 +38,7 @@ Use this skill when the user asks:
 
 Generate innovation point candidates, perform novelty search, and review/score.
 
-When the user asks for "another batch", "different ideas", "再换几个", "别的", or "重新生成", call this tool with `overwrite=True` so the workflow does not reuse cached files from the previous run.
+When the user asks for "another batch", "different ideas", "再换一个", "换一个", "再换几个", "别的", or "重新生成", call this tool with `overwrite=True` so the workflow does not reuse cached files from the previous run.
 Do **not** shell out with `exec` to import a helper module when `innovation_workflow` is available directly.
 
 ```python
@@ -67,7 +69,7 @@ innovation_workflow(topic="my research topic", overwrite=True)
 - `min_proceed`: Stop iterating when this many "proceed" candidates found (default: 1)
 - `revise_top_k`: Max revise candidates to revise per round (default: 3)
 - `stop_if_no_change`: Stop if no new proceed candidates in a round (default: True)
-- `enable_landscape`: Enable landscape survey before candidate generation (default: False)
+- `enable_landscape`: Enable landscape survey before candidate generation (default: True, auto-enabled when no local papers)
 - `landscape_max_online`: Max papers per online source in landscape survey (default: 8)
 
 > **Note:** `enable_iteration=True` requires `enable_review=True`. The iteration loop depends on review scores to decide which candidates to revise and when to stop.

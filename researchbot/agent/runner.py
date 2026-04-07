@@ -103,18 +103,19 @@ class AgentRunner:
             if response.has_tool_calls:
                 if hook.wants_streaming():
                     await hook.on_stream_end(context, resuming=True)
+                await hook.before_execute_tools(context)
+
+                effective_tool_calls = list(context.tool_calls) if context.tool_calls else list(response.tool_calls)
 
                 messages.append(build_assistant_message(
                     response.content or "",
-                    tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+                    tool_calls=[tc.to_openai_tool_call() for tc in effective_tool_calls],
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 ))
-                tools_used.extend(tc.name for tc in response.tool_calls)
+                tools_used.extend(tc.name for tc in effective_tool_calls)
 
-                await hook.before_execute_tools(context)
-
-                results, new_events, fatal_error = await self._execute_tools(spec, response.tool_calls)
+                results, new_events, fatal_error = await self._execute_tools(spec, effective_tool_calls)
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
@@ -125,7 +126,7 @@ class AgentRunner:
                     context.stop_reason = stop_reason
                     await hook.after_iteration(context)
                     break
-                for tool_call, result in zip(response.tool_calls, results):
+                for tool_call, result in zip(effective_tool_calls, results):
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,

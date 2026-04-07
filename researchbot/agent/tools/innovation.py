@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import re
+import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -271,6 +275,7 @@ Your task is to produce a REVISED candidate that addresses the specific weakness
 5. If feasibility was low, simplify the approach or leverage more existing tools
 6. If risk was high, add mitigations or reduce the risk profile
 7. Preserve what makes the candidate novel - do not abandon the core innovation
+8. **Generate new keywords that reflect the revised idea** - the revision may shift the focus, so keywords must accurately describe the new direction for subsequent novelty search. Extract keywords from the revised title, problem, and idea, not just copied from the original.
 
 ### What you MUST NOT do:
 - Do not just rephrase the same idea
@@ -786,6 +791,46 @@ def _format_related_papers_for_revision(papers: list[dict[str, Any]], max_papers
     return "\n".join(lines)
 
 
+def _extract_keywords_from_text(text: str, max_keywords: int = 5) -> list[str]:
+    """Extract representative keywords from text content.
+
+    Used as fallback when a candidate (especially a revised one) doesn't
+    provide explicit keywords.
+    """
+    # Common stop words to filter out
+    stop_words = {
+        "the", "a", "an", "and", "or", "but", "is", "are", "was", "were",
+        "be", "been", "being", "have", "has", "had", "do", "does", "did",
+        "will", "would", "could", "should", "may", "might", "can",
+        "this", "that", "these", "those", "it", "its", "they", "them",
+        "their", "what", "which", "who", "whom", "when", "where", "why", "how",
+        "for", "with", "without", "from", "into", "through", "during",
+        "new", "different", "specific", "approach", "method", "using",
+        "based", "method", "problem", "research", "paper", "work",
+    }
+
+    # Split into words, filter short words and stop words
+    words = re.findall(r'[a-zA-Z]{3,}', text.lower())
+    filtered = [w for w in words if w not in stop_words]
+
+    # Count word frequency
+    word_counts = Counter(filtered)
+
+    # Get most common words as keywords
+    common = word_counts.most_common(max_keywords * 2)
+    keywords = []
+    seen_stems: set[str] = set()
+
+    for word, count in common:
+        # Avoid near-duplicates (same stem)
+        stem = word[:4]
+        if stem not in seen_stems and len(keywords) < max_keywords:
+            keywords.append(word)
+            seen_stems.add(stem)
+
+    return keywords
+
+
 def _normalize_revised_candidate(
     raw: dict[str, Any],
     parent_title: str,
@@ -794,6 +839,17 @@ def _normalize_revised_candidate(
 ) -> dict[str, Any]:
     """Normalize a revised candidate, filling in revision tracking fields."""
     base = _normalize_candidate(raw)
+
+    # Fallback: if keywords are empty (LLM didn't generate them), extract from content
+    if not base.get("keywords"):
+        content_text = " ".join([
+            base.get("title", ""),
+            base.get("problem", ""),
+            base.get("idea", ""),
+            base.get("key_difference", ""),
+        ])
+        base["keywords"] = _extract_keywords_from_text(content_text)
+
     base["parent_candidate"] = parent_title
     base["revision_round"] = round_num
     base["revision_reason"] = revision_reason
@@ -931,8 +987,8 @@ class InnovationWorkflowTool(Tool):
             },
             "enable_landscape": {
                 "type": "boolean",
-                "description": "Enable landscape survey stage before candidate generation: local scan + multi-source search + literature map (default: false)",
-                "default": False,
+                "description": "Enable landscape survey stage before candidate generation: local scan + multi-source search + literature map (default: true, auto-enabled when no local papers)",
+                "default": True,
             },
             "landscape_max_online": {
                 "type": "integer",
@@ -944,6 +1000,9 @@ class InnovationWorkflowTool(Tool):
         },
         "required": ["topic"],
     }
+
+    # Class-level locks per topic slug to prevent concurrent same-topic execution
+    _locks: dict[str, asyncio.Lock] = {}
 
     def __init__(
         self,
@@ -1044,49 +1103,80 @@ class InnovationWorkflowTool(Tool):
         query: str,
         max_papers: int = 5,
     ) -> list[dict[str, Any]]:
-        """Find most relevant papers for a query using semantic index if available.
+        """Find most relevant papers for a query using semantic index + keyword scoring.
 
-        Works correctly in async contexts. Falls back to keyword scoring if
-        the semantic index is unavailable or errors out.
+        Uses hybrid search (semantic + keyword) as the primary path and merges
+        results to maximize coverage. Falls back to keyword-only scoring if
+        the semantic index is unavailable.
         """
         all_papers = self._load_local_papers()
         if not all_papers:
             return []
 
-        # Try semantic search first
+        paper_by_id: dict[str, dict[str, Any]] = {}
+        for p in all_papers:
+            pid = p.get("paper_id")
+            if pid:
+                paper_by_id[pid] = p
+
+        # Semantic search score for each paper_id (0 if not returned)
+        semantic_scores: dict[str, float] = {}
         search_index = self._get_search_index()
         if search_index is not None:
             try:
                 await search_index.initialize()
-                results = await search_index.search(query, top_k=max_papers, rerank=False)
+                results = await search_index.search(query, top_k=max_papers * 2, rerank=False)
                 search_index.close()
-                if results:
-                    papers = []
-                    seen_ids = set()
-                    for r in results:
-                        paper_id = r.get("paper_id")
-                        if paper_id and paper_id not in seen_ids:
-                            seen_ids.add(paper_id)
-                            paper = next(
-                                (p for p in all_papers if p.get("paper_id") == paper_id),
-                                None,
-                            )
-                            if paper:
-                                papers.append(paper)
-                    if papers:
-                        return papers
+                for r in results:
+                    pid = r.get("paper_id")
+                    if pid:
+                        # Use combined rank as score (lower rank = higher score)
+                        # RRF score is in r.get("score", 0), fall back to position
+                        semantic_scores[pid] = r.get("score", 0) or (1.0 / (r.get("rank", max_papers) + 1))
             except Exception:
-                pass
+                semantic_scores = {}
 
-        # Fallback: keyword-based relevance scoring
-        scored = []
-        for paper in all_papers:
+        # Keyword-based relevance scoring for all papers
+        keyword_scores: dict[str, float] = {}
+        for pid, paper in paper_by_id.items():
             score = self._score_paper_relevance(paper, query)
             if score > 0:
-                scored.append((score, paper))
+                keyword_scores[pid] = score
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [p for s, p in scored[:max_papers] if s > 0]
+        # Merge: combine semantic and keyword scores, deduplicate
+        # Score = normalized semantic score * keyword score (both must agree)
+        # Or semantic-only if keyword score is 0 (semantic found something keyword missed)
+        combined: list[tuple[float, dict[str, Any]]] = []
+        seen_pids: set[str] = set()
+
+        # Papers returned by semantic search (sorted by semantic score)
+        for pid, sem_score in sorted(semantic_scores.items(), key=lambda x: x[1], reverse=True):
+            kw_score = keyword_scores.get(pid, 0.0)
+            paper = paper_by_id.get(pid)
+            if not paper or pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+
+            if kw_score > 0:
+                # Both signals agree → boost
+                combined_score = sem_score * kw_score
+            else:
+                # Semantic only → use semantic score alone
+                combined_score = sem_score * 0.5  # dampen to not over-rank semantic-only
+            combined.append((combined_score, paper))
+
+        # Papers found only by keyword search (not in semantic results)
+        for pid, kw_score in keyword_scores.items():
+            if pid in seen_pids:
+                continue
+            paper = paper_by_id.get(pid)
+            if paper:
+                seen_pids.add(pid)
+                combined.append((kw_score * 0.5, paper))  # keyword-only gets lower priority
+
+        # Sort by combined score descending
+        combined.sort(key=lambda x: x[0], reverse=True)
+        return [p for _score, p in combined[:max_papers]]
 
     def _get_search_index(self):
         """Get or create the search index (lazy initialization)."""
@@ -1200,7 +1290,6 @@ class InnovationWorkflowTool(Tool):
                     all_papers.append(p)
 
         # Run all three searches concurrently
-        import asyncio
         results = await asyncio.gather(
             self._search_arxiv(topic, max_per_source),
             self._search_crossref(topic, max_per_source),
@@ -1584,8 +1673,24 @@ class InnovationWorkflowTool(Tool):
             "Generate 3-8 candidate innovation points.",
             f"Generate exactly {num_candidates} candidate innovation points.",
         )
+
+        # Random angle emphasis to ensure different candidates on each run
+        angle_prompts = [
+            "Focus on problem definition innovations: new task framings, sub-problem identifications, or evaluation metric designs.",
+            "Focus on method innovations: new algorithms, architecture changes, or optimization techniques.",
+            "Focus on experimental innovations: new analysis frameworks, tooling, or infrastructure approaches.",
+            "Focus on setting innovations: new datasets, domain adaptations, or evaluation protocols.",
+            "Prioritize highly specific and actionable ideas with concrete mechanisms rather than broad conceptual directions.",
+            "Prioritize novel combinations of existing techniques that haven't been explored in this research area.",
+            "Explore underexplored angles: consider practical deployment challenges, domain-specific constraints, or cross-domain applications.",
+        ]
+        random_angle = random.choice(angle_prompts)
+
+        run_nonce = uuid.uuid4().hex[:8]
+
         diversity_plan = (
-            "Diversity plan: make each candidate clearly different in angle, not just wording. "
+            f"Diversity plan: {random_angle} "
+            "Make each candidate clearly different in angle, not just wording. "
             "Use concrete mechanisms and specific sub-problems instead of broad umbrella statements."
         )
         if num_candidates >= 4:
@@ -1595,13 +1700,16 @@ class InnovationWorkflowTool(Tool):
             )
         elif num_candidates == 3:
             diversity_plan += " Prefer three different innovation levels."
-        prompt = f"{prompt}\n\n{diversity_plan}"
+        prompt = (
+            f"{prompt}\n\n{diversity_plan}\n"
+            f"Variation token: {run_nonce}. Treat this run as an independent ideation batch and avoid reusing prior phrasings."
+        )
 
         messages = [{"role": "user", "content": prompt}]
 
         for attempt in range(2):
             try:
-                response = await self._provider.chat_with_retry(messages)
+                response = await self._provider.chat_with_retry(messages, temperature=0.85)
                 content = response.content or ""
 
                 result = _parse_json_robust(content, expect_array=True)
@@ -2161,14 +2269,16 @@ class InnovationWorkflowTool(Tool):
         enable_review: bool = True,
     ) -> list[dict[str, Any]]:
         """Run novelty search and review for a batch of candidates in one iteration round."""
-        results = []
 
-        for candidate in candidates:
+        async def process_single_candidate(
+            candidate: dict[str, Any],
+        ) -> dict[str, Any]:
+            """Process novelty search and review for a single candidate."""
             keywords = candidate.get("keywords", [])
             if isinstance(keywords, str):
                 keywords = [k.strip() for k in keywords.split(",")]
 
-            related_papers = []
+            related_papers: list[dict[str, Any]] = []
 
             if search_local and keywords:
                 query = " ".join(keywords)
@@ -2188,9 +2298,9 @@ class InnovationWorkflowTool(Tool):
                     pass
 
             # Store full paper info
-            full_related_papers = []
+            full_related_papers: list[dict[str, Any]] = []
             for p in related_papers[:max_related]:
-                paper_record = {
+                paper_record: dict[str, Any] = {
                     "paper_id": p.get("paper_id", ""),
                     "title": p.get("title", ""),
                     "abstract": p.get("abstract", ""),
@@ -2214,14 +2324,17 @@ class InnovationWorkflowTool(Tool):
                     "decision": "revise",
                 })
 
-            results.append({
+            return {
                 "candidate": candidate,
                 "analysis": analysis,
                 "review": review,
                 "related_papers": full_related_papers,
-            })
+            }
 
-        return results
+        results = await asyncio.gather(
+            *[process_single_candidate(c) for c in candidates]
+        )
+        return list(results)
 
     def _save_iteration_reports(
         self,
@@ -2880,7 +2993,7 @@ class InnovationWorkflowTool(Tool):
     async def execute(
         self,
         search_online: bool = True,
-        max_related: int = 5,
+        max_related: int = 18,
         enable_review: bool = True,
         top_k: int = 3,
         overwrite: bool = False,
@@ -2889,7 +3002,7 @@ class InnovationWorkflowTool(Tool):
         min_proceed: int = 1,
         revise_top_k: int = 3,
         stop_if_no_change: bool = True,
-        enable_landscape: bool = False,
+        enable_landscape: bool = True,
         landscape_max_online: int = 8,
         **kwargs: Any,
     ) -> str:
@@ -2903,6 +3016,38 @@ class InnovationWorkflowTool(Tool):
             return "Error: workspace not configured"
 
         slug = _slugify(topic)
+
+        # Prevent concurrent same-topic execution with per-slug lock
+        if slug not in InnovationWorkflowTool._locks:
+            InnovationWorkflowTool._locks[slug] = asyncio.Lock()
+        async with InnovationWorkflowTool._locks[slug]:
+            return await self._execute_impl(
+                topic, slug, num_candidates, search_local,
+                search_online, max_related, enable_review, top_k,
+                overwrite, enable_iteration, max_rounds, min_proceed,
+                revise_top_k, stop_if_no_change, enable_landscape,
+                landscape_max_online,
+            )
+
+    async def _execute_impl(
+        self,
+        topic: str,
+        slug: str,
+        num_candidates: int,
+        search_local: bool,
+        search_online: bool,
+        max_related: int,
+        enable_review: bool,
+        top_k: int,
+        overwrite: bool,
+        enable_iteration: bool,
+        max_rounds: int,
+        min_proceed: int,
+        revise_top_k: int,
+        stop_if_no_change: bool,
+        enable_landscape: bool,
+        landscape_max_online: int,
+    ) -> str:
         output_dir = self._resolve_path(f"innovation/{slug}")
 
         # Build workflow metadata with input params
@@ -2931,6 +3076,21 @@ class InnovationWorkflowTool(Tool):
         # Stage 0: Landscape survey (optional, before everything else)
         # =====================================================================
         landscape_context = ""
+
+        # Auto-enable landscape if no local papers found (ensure context coverage)
+        if not enable_landscape and search_local:
+            local_papers = self._load_local_papers()
+            # Filter papers relevant to topic using simple keyword matching
+            if local_papers:
+                topic_lower = topic.lower()
+                relevant_count = sum(
+                    1 for p in local_papers
+                    if topic_lower in p.get("title", "").lower()
+                    or topic_lower in p.get("abstract", "").lower()
+                )
+                if relevant_count == 0:
+                    enable_landscape = True
+
         if enable_landscape:
             _, landscape_context = await self._run_landscape_survey(
                 topic, output_dir, metadata,
@@ -3136,14 +3296,16 @@ class InnovationWorkflowTool(Tool):
             metadata["stages"]["stage2_novelty"]["note"] = "Reused existing file"
             _save_workflow_metadata(metadata, self._workspace, topic)
         else:
-            novelty_results = []
-
-            for candidate in candidates:
+            # Concurrent novelty search for all candidates
+            async def process_candidate_novelty(
+                candidate: dict[str, Any],
+            ) -> dict[str, Any]:
+                """Process novelty search for a single candidate."""
                 keywords = candidate.get("keywords", [])
                 if isinstance(keywords, str):
                     keywords = [k.strip() for k in keywords.split(",")]
 
-                related_papers = []
+                related_papers: list[dict[str, Any]] = []
 
                 if search_local and keywords:
                     query = " ".join(keywords)
@@ -3165,9 +3327,9 @@ class InnovationWorkflowTool(Tool):
                 analysis = await self._analyze_novelty(candidate, related_papers)
 
                 # Store full paper info for Stage 3 review
-                full_related_papers = []
+                full_related_papers: list[dict[str, Any]] = []
                 for p in related_papers[:max_related]:
-                    paper_record = {
+                    paper_record: dict[str, Any] = {
                         "paper_id": p.get("paper_id", ""),
                         "title": p.get("title", ""),
                         "abstract": p.get("abstract", ""),
@@ -3179,11 +3341,15 @@ class InnovationWorkflowTool(Tool):
                     }
                     full_related_papers.append(paper_record)
 
-                novelty_results.append({
+                return {
                     "candidate": candidate,
                     "analysis": analysis,
                     "related_papers": full_related_papers,
-                })
+                }
+
+            novelty_results = await asyncio.gather(
+                *[process_candidate_novelty(c) for c in candidates]
+            )
 
             novelty_json_path, novelty_md_path = self._save_novelty_report(topic, novelty_results)
             metadata["stages"]["stage2_novelty"]["status"] = "completed"
@@ -3224,9 +3390,11 @@ class InnovationWorkflowTool(Tool):
                 metadata["stages"]["stage3_review"]["note"] = "Reused existing file"
                 _save_workflow_metadata(metadata, self._workspace, topic)
             else:
-                review_results = []
-
-                for result in novelty_results:
+                # Concurrent review for all candidates
+                async def process_candidate_review(
+                    result: dict[str, Any],
+                ) -> dict[str, Any]:
+                    """Review a single candidate."""
                     candidate = result.get("candidate", {})
                     analysis = result.get("analysis", {})
                     related = result.get("related_papers", [])
@@ -3235,11 +3403,15 @@ class InnovationWorkflowTool(Tool):
                         candidate, analysis, related
                     )
 
-                    review_results.append({
+                    return {
                         "candidate": candidate,
                         "analysis": analysis,
                         "review": review,
-                    })
+                    }
+
+                review_results = await asyncio.gather(
+                    *[process_candidate_review(r) for r in novelty_results]
+                )
 
                 # Sort by overall_score descending and pick top_k
                 sorted_results = sorted(

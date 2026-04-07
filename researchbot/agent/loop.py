@@ -83,6 +83,11 @@ class _LoopHook(AgentHook):
         self._stream_buf = ""
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
+        context.tool_calls = self._loop._rewrite_exec_innovation_calls(
+            context.tool_calls,
+            context.messages,
+        )
+
         if self._on_progress:
             if not self._on_stream:
                 thought = self._loop._strip_think(
@@ -415,6 +420,133 @@ class AgentLoop:
         if any(term in corpus for term in innovation_terms):
             return ["innovation"]
         return []
+
+    @staticmethod
+    def _extract_innovation_topic(text: str) -> str | None:
+        """Extract topic from common innovation request phrasings."""
+        if not text:
+            return None
+
+        text = text.strip()
+        patterns = [
+            r"以(.+?)的创新点",
+            r"关于(.+?)的创新点",
+            r"帮我想(.+?)的创新点",
+            r"帮我想以(.+?)为baseline",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                topic = m.group(1).strip(" ，。,.!?！？")
+                if topic:
+                    return topic
+        return None
+
+    @staticmethod
+    def _parse_exec_innovation_args(command: str) -> dict[str, Any]:
+        """Parse innovation_workflow(...) args from an exec command string."""
+        params: dict[str, Any] = {}
+
+        topic_match = re.search(r'topic\s*=\s*["\']([^"\']+)["\']', command, re.IGNORECASE)
+        if topic_match:
+            params["topic"] = topic_match.group(1).strip()
+
+        int_keys = (
+            "num_candidates", "max_related", "top_k", "max_rounds",
+            "min_proceed", "revise_top_k", "landscape_max_online",
+        )
+        for key in int_keys:
+            m = re.search(rf"{key}\s*=\s*(\d+)", command, re.IGNORECASE)
+            if m:
+                params[key] = int(m.group(1))
+
+        bool_keys = (
+            "search_local", "search_online", "enable_review", "overwrite",
+            "enable_iteration", "stop_if_no_change", "enable_landscape",
+        )
+        for key in bool_keys:
+            m = re.search(rf"{key}\s*=\s*(true|false)", command, re.IGNORECASE)
+            if m:
+                params[key] = m.group(1).lower() == "true"
+
+        return params
+
+    def _rewrite_exec_innovation_calls(
+        self,
+        tool_calls: list[Any],
+        messages: list[dict[str, Any]],
+    ) -> list[Any]:
+        """Rewrite exec-based innovation workflow calls into direct innovation_workflow tool calls.
+
+        Detects when the Agent has both an exec innovation call AND a direct innovation_workflow
+        tool call for the same topic, and deduplicates by dropping the exec rewrite when a
+        direct call already exists.
+        """
+        from researchbot.providers.base import ToolCallRequest
+
+        rewritten: list[Any] = []
+
+        latest_user_text = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                latest_user_text = self._message_content_to_text(m.get("content"))
+                if latest_user_text:
+                    break
+
+        # Extract direct innovation_workflow topics and check for existence in one pass
+        direct_topics: set[str] = set()
+        has_direct_call = False
+        for tc in tool_calls:
+            if tc.name == "innovation_workflow":
+                has_direct_call = True
+                args = tc.arguments if isinstance(tc.arguments, dict) else {}
+                topic = str(args.get("topic", "")).lower().strip()
+                if topic:
+                    direct_topics.add(topic)
+
+        for tc in tool_calls:
+            if tc.name != "exec":
+                rewritten.append(tc)
+                continue
+
+            args = tc.arguments if isinstance(tc.arguments, dict) else {}
+            command = str(args.get("command", ""))
+            command_lower = command.lower()
+            if "innovation_workflow" not in command_lower and "skills.innovation.workflow" not in command_lower:
+                rewritten.append(tc)
+                continue
+
+            parsed = self._parse_exec_innovation_args(command)
+            if not parsed.get("topic"):
+                inferred_topic = self._extract_innovation_topic(latest_user_text)
+                if inferred_topic:
+                    parsed["topic"] = inferred_topic
+
+            if not parsed.get("topic"):
+                rewritten.append(tc)
+                continue
+
+            # If a direct innovation_workflow call exists for the same topic, skip rewrite
+            # to avoid duplicate execution. Let the direct call (which Agent authored) win.
+            topic_lower = parsed.get("topic", "").lower().strip()
+            if has_direct_call and topic_lower in direct_topics:
+                logger.info("Skipping exec rewrite: direct innovation_workflow call already exists for topic: {}", parsed.get("topic"))
+                continue
+
+            # Keep behavior close to exec wrapper: prefer fresh generation.
+            parsed.setdefault("overwrite", True)
+
+            rewritten.append(ToolCallRequest(
+                id=tc.id,
+                name="innovation_workflow",
+                arguments=parsed,
+                extra_content=tc.extra_content,
+                provider_specific_fields=tc.provider_specific_fields,
+                function_provider_specific_fields=tc.function_provider_specific_fields,
+            ))
+            logger.info("Rerouted exec innovation call to innovation_workflow with params: {}", parsed)
+
+        return rewritten
 
     async def _run_agent_loop(
         self,
@@ -783,11 +915,50 @@ class AgentLoop:
 
     @staticmethod
     def _preprocess_tool_syntax(content: str) -> str:
-        """Convert tool-call-like syntax into natural language for the LLM."""
+        """Convert tool-call-like syntax into natural language for the LLM.
+
+        Also handles "再换几个" / "别的" / "重新生成" style regeneration requests
+        and converts them to explicit tool-call instructions with overwrite=True.
+        """
+        content_stripped = content.strip()
+
+        # Regeneration trigger phrases → force overwrite=True for innovation_workflow
+        innovation_regen_patterns = (
+            "再换一个", "换一个", "再换几个", "别的", "来个别的", "换个方向",
+            "再帮我想", "重新生成", "重来一版", "再来一版",
+            "换一批", "再来几个", "再想几个", "再生成几个",
+            "different ideas", "another batch", "more ideas",
+            "regenerate", "generate more",
+        )
+        if any(pat in content_stripped for pat in innovation_regen_patterns):
+            # Extract topic from conversation context if present
+            # Look for recent topic keywords
+            topic_hint = ""
+            topic_keywords = (
+                "弱监督视频异常检测", "vadclip", "VADClip",
+                "weakly supervised", "video anomaly detection",
+                "large language model", "LLM", "graph neural network",
+                "GNN", "retrieval", "RAG", "multimodal",
+            )
+            for kw in topic_keywords:
+                if kw.lower() in content_stripped.lower():
+                    topic_hint = kw
+                    break
+            if topic_hint:
+                return (
+                    f"使用innovation_workflow topic=\"{topic_hint}\" overwrite=True "
+                    f"重新生成不同于之前的创新点候选"
+                )
+            else:
+                return (
+                    "使用innovation_workflow overwrite=True 重新生成创新点候选，"
+                    "确保生成与之前不同的角度和方向"
+                )
+
         # Match patterns like: innovation_workflow topic="..." num_candidates=5
         # or: paper_search query="..." max_results=10
         tool_call_pattern = r'^(\w+)\s+(topic|query|message)=["\']([^"\']+)["\']?\s*(.*)?$'
-        match = re.match(tool_call_pattern, content.strip(), re.IGNORECASE)
+        match = re.match(tool_call_pattern, content_stripped, re.IGNORECASE)
         if match:
             tool_name = match.group(1)
             primary_arg = match.group(2)
