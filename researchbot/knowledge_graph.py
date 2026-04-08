@@ -185,11 +185,11 @@ class KnowledgeGraph:
     # Paper-level upsert (writes all edges for one paper at once)
     # -------------------------------------------------------------------------
 
-    def upsert_paper(self, paper: dict[str, Any]) -> None:
+    def upsert_paper(self, paper: dict[str, Any], *, commit: bool = True) -> None:
         """Write all graph edges for a paper.
 
         Calls upsert_citations, upsert_concepts, upsert_authors, and
-        upsert_related_works in a single transaction.
+        upsert_related_works in a single transaction. Caller controls commit.
         """
         paper_id = paper.get("paper_id", "")
         if not paper_id:
@@ -218,7 +218,8 @@ class KnowledgeGraph:
         if related:
             self._upsert_related_works(conn, paper_id, related, now)
 
-        conn.commit()
+        if commit:
+            conn.commit()
 
     def _upsert_citations(
         self, conn: sqlite3.Connection, paper_id: str, references: list[str], now: str

@@ -42,21 +42,6 @@ def _compute_content_hash(paper: dict[str, Any]) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
-def _compute_graph_hash(paper: dict[str, Any]) -> str:
-    """Compute a hash of graph-relevant fields for knowledge-graph sync decisions.
-
-    Includes fields that affect citation edges, concept edges, author edges,
-    and related-work edges — but NOT text fields tracked by content_hash.
-    """
-    parts = [
-        ",".join(sorted(paper.get("authors", []))),
-        ",".join(sorted(paper.get("referenced_works", []))),
-        ",".join(sorted(paper.get("concepts", []))),
-        ",".join(sorted(paper.get("related_works", []))),
-    ]
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-
-
 def _summary_text(summary: dict[str, Any] | str) -> str:
     """Extract searchable text from summary dict or string."""
     if isinstance(summary, str):
@@ -335,7 +320,6 @@ class SearchIndex:
 
         # Parse nested fields (always needed for papers upsert)
         summary = paper.get("summary", {})
-        summary = paper.get("summary", {})
         if isinstance(summary, dict):
             summary_json = json.dumps(summary, ensure_ascii=False)
         elif isinstance(summary, str):
@@ -445,15 +429,15 @@ class SearchIndex:
                     except Exception:
                         pass
 
-        conn.commit()
-
-        # Sync to knowledge graph (uses same conn — same transaction)
+        # Sync to knowledge graph (same conn, same transaction)
         try:
             self._ensure_graph_initialized()
             kg = KnowledgeGraph(self)
-            kg.upsert_paper(paper)
+            kg.upsert_paper(paper, commit=False)
         except Exception as e:
             logger.warning(f"Failed to sync paper {paper_id} to knowledge graph: {e}")
+
+        conn.commit()
 
         return content_changed
 

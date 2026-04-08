@@ -21,6 +21,7 @@ from researchbot.agent.tools.metadata_merge import (
 from researchbot.config.schema import SemanticSearchConfig
 from researchbot.knowledge_graph import KnowledgeGraph
 from researchbot.search_index import SearchIndex
+from researchbot.utils.helpers import safe_filename
 
 
 DEFAULT_TIMEOUT = 30.0
@@ -40,17 +41,17 @@ def _make_safe_paper_id(paper: dict[str, Any]) -> str:
     """
     # Priority 1: existing paper_id
     existing_id = paper.get("paper_id", "")
-    if existing_id and _is_safe_filename(existing_id):
+    if existing_id and existing_id == safe_filename(existing_id):
         return existing_id
 
     # Priority 2: arXiv ID
     arxiv_id = paper.get("external_ids", {}).get("arxiv", "")
-    if arxiv_id and _is_safe_filename(arxiv_id):
+    if arxiv_id and arxiv_id == safe_filename(arxiv_id):
         return arxiv_id
 
     # Priority 3: OpenAlex ID
     openalex_id = paper.get("external_ids", {}).get("openalex", "")
-    if openalex_id and _is_safe_filename(openalex_id):
+    if openalex_id and openalex_id == safe_filename(openalex_id):
         return openalex_id
 
     # Priority 4: DOI (safe version)
@@ -70,18 +71,6 @@ def _make_safe_paper_id(paper: dict[str, Any]) -> str:
 
     # Fallback: use a timestamp-based ID
     return f"paper_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-
-
-def _is_safe_filename(name: str) -> bool:
-    """Check if a string is safe for use as a filename."""
-    if not name:
-        return False
-    # Check for characters that are problematic on most filesystems
-    unsafe_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0']
-    for char in unsafe_chars:
-        if char in name:
-            return False
-    return True
 
 
 def _safe_filename(s: str) -> str:
@@ -551,15 +540,12 @@ class PaperEnrichTool(Tool):
                 result["paper_id"] = _make_safe_paper_id(result)
             saved_path = self._save_enriched(result)
 
-            # Update search index
+            # Update search index (includes knowledge graph sync)
             search_index = self._get_search_index()
             if search_index is not None:
                 try:
                     await search_index.initialize()
                     await search_index.upsert_paper(result)
-                    # Sync to knowledge graph
-                    kg = search_index.get_graph()
-                    kg.upsert_paper(result)
                     search_index.close()
                 except Exception:
                     pass  # Don't fail if index update fails
