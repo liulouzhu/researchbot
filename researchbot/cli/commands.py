@@ -1222,7 +1222,87 @@ def status():
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                key_status = "[green]OK[/green]" if has_key else "[dim]not set[/dim]"
+                console.print(f"{spec.label}: {key_status}")
+
+
+# ============================================================================
+# Knowledge Graph
+# ============================================================================
+
+
+@app.command(name="rebuild-graph")
+def rebuild_graph(
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Rebuild the knowledge graph from existing papers in local storage.
+
+    Scans all papers in literature/papers/, extracts graph relationships
+    (citations, concepts, authors, related_works), and writes them to the graph.
+    """
+    from researchbot.config.loader import load_config, set_config_path
+
+    # Load config
+    if config:
+        config_path = Path(config).expanduser().resolve()
+        if not config_path.exists():
+            console.print(f"[red]Config not found: {config_path}[/red]")
+            raise typer.Exit(1)
+        set_config_path(config_path)
+    config = load_config()
+
+    ws = Path(workspace) if workspace else config.workspace_path
+    if not ws.exists():
+        console.print(f"[red]Workspace not found: {ws}[/red]")
+        raise typer.Exit(1)
+
+    literature_dir = ws / "literature"
+    papers_dir = literature_dir / "papers"
+    if not papers_dir.exists():
+        console.print(f"[yellow]No papers directory found at {papers_dir}[/yellow]")
+        console.print("Nothing to rebuild.")
+        return
+
+    # Initialize search index (which also initializes graph tables)
+    import json
+    import asyncio
+    from researchbot.knowledge_graph import KnowledgeGraph
+    from researchbot.search_index import SearchIndex
+
+    db_path = ws / config.literature.semantic_search.sqlite_db_path
+    search_index = SearchIndex(db_path, config.literature.semantic_search)
+
+    console.print("[cyan]Initializing graph tables...[/cyan]")
+    search_index._get_conn()  # ensure dir exists
+    asyncio.run(search_index.initialize())
+    kg = search_index.get_graph()
+
+    # Load all papers
+    console.print("[cyan]Scanning papers...[/cyan]")
+    papers: list[dict] = []
+    for json_file in papers_dir.glob("*.json"):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                paper = json.load(f)
+                papers.append(paper)
+        except Exception:
+            pass
+
+    total = len(papers)
+    console.print(f"[cyan]Found {total} papers, building graph...[/cyan]")
+
+    count = kg.rebuild_from_papers(papers)
+    stats = kg.stats()
+    search_index.close()
+
+    console.print(f"[green]✓[/green] Graph rebuilt from {count} papers")
+    console.print(f"  Concepts: {stats['concepts']}")
+    console.print(f"  Authors: {stats['authors']}")
+    console.print(f"  Citation edges: {stats['citation_edges']}")
+    console.print(f"  Paper-concept edges: {stats['paper_concept_edges']}")
+    console.print(f"  Author collaborations: {stats['author_collaborations']}")
+    console.print(f"  Paper related edges: {stats['paper_related_edges']}")
 
 
 # ============================================================================

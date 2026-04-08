@@ -31,7 +31,7 @@ def _resolve_workspace() -> Path:
     if ws:
         return Path(ws)
     # Default workspace
-    return Path.home() / ".nanobot" / "workspace"
+    return Path.home() / ".researchbot" / "workspace"
 
 
 def _load_provider():

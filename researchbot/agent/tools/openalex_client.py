@@ -115,15 +115,17 @@ def _parse_openalex_work(item: dict[str, Any]) -> OpenAlexWork:
         year = date[:4]
 
     # Journal info
-    primary_location = item.get("primary_location", {})
-    journal = primary_location.get("source", {}).get("display_name", "")
+    primary_location = item.get("primary_location") or {}
+    source_info = primary_location.get("source") or {}
+    journal = source_info.get("display_name", "")
     if not journal:
-        best_oa = item.get("best_oa_location", {})
-        journal = best_oa.get("source", {}).get("display_name", "")
+        best_oa = item.get("best_oa_location") or {}
+        source_info = best_oa.get("source") or {}
+        journal = source_info.get("display_name", "")
 
-    volume = primary_location.get("source", {}).get("volume", "") or ""
-    issue = primary_location.get("source", {}).get("issue", "") or ""
-    pages = primary_location.get("source", {}).get("page", "") or ""
+    volume = source_info.get("volume", "") or ""
+    issue = source_info.get("issue", "") or ""
+    pages = source_info.get("page", "") or ""
 
     publisher = item.get("publisher", "") or ""
 
@@ -252,8 +254,8 @@ async def search_openalex(
 
     proxies = proxy or None
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(url, params=params, headers=headers, proxies=proxies)
+    async with httpx.AsyncClient(timeout=timeout, proxy=proxies) as client:
+        response = await client.get(url, params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
 
@@ -294,9 +296,9 @@ async def get_openalex_work(
 
     url = f"{OPENALEX_API_BASE}/works/{identifier}"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, proxy=proxies) as client:
         try:
-            response = await client.get(url, params=params, headers=headers, proxies=proxies)
+            response = await client.get(url, params=params, headers=headers)
             if response.status_code == 404:
                 return None
             response.raise_for_status()

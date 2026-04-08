@@ -19,6 +19,7 @@ from researchbot.agent.tools.metadata_merge import (
     normalize_from_openalex,
 )
 from researchbot.config.schema import SemanticSearchConfig
+from researchbot.knowledge_graph import KnowledgeGraph
 from researchbot.search_index import SearchIndex
 
 
@@ -556,6 +557,9 @@ class PaperEnrichTool(Tool):
                 try:
                     await search_index.initialize()
                     await search_index.upsert_paper(result)
+                    # Sync to knowledge graph
+                    kg = search_index.get_graph()
+                    kg.upsert_paper(result)
                     search_index.close()
                 except Exception:
                     pass  # Don't fail if index update fails

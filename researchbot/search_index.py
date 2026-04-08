@@ -27,6 +27,7 @@ from loguru import logger
 
 from researchbot.config.schema import SemanticSearchConfig
 from researchbot.embedding import EmbeddingClient, bytes_to_vector, vector_to_bytes
+from researchbot.knowledge_graph import KnowledgeGraph
 
 
 def _compute_content_hash(paper: dict[str, Any]) -> str:
@@ -37,6 +38,21 @@ def _compute_content_hash(paper: dict[str, Any]) -> str:
         _summary_text(paper.get("summary", {})),
         ",".join(sorted(paper.get("keywords", []))),
         ",".join(sorted(paper.get("topic_tags", []))),
+    ]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _compute_graph_hash(paper: dict[str, Any]) -> str:
+    """Compute a hash of graph-relevant fields for knowledge-graph sync decisions.
+
+    Includes fields that affect citation edges, concept edges, author edges,
+    and related-work edges — but NOT text fields tracked by content_hash.
+    """
+    parts = [
+        ",".join(sorted(paper.get("authors", []))),
+        ",".join(sorted(paper.get("referenced_works", []))),
+        ",".join(sorted(paper.get("concepts", []))),
+        ",".join(sorted(paper.get("related_works", []))),
     ]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
@@ -92,6 +108,7 @@ class SearchIndex:
         self._conn: sqlite3.Connection | None = None
         self._embedding_client: EmbeddingClient | None = None
         self._sqlite_vec_available: bool = False
+        self._graph_initialized: bool = False
 
     @property
     def embedding_client(self) -> EmbeddingClient:
@@ -104,6 +121,10 @@ class SearchIndex:
     def sqlite_vec_available(self) -> bool:
         """Whether sqlite-vec extension is available."""
         return self._sqlite_vec_available
+
+    def get_graph(self) -> KnowledgeGraph:
+        """Get the KnowledgeGraph instance sharing this SearchIndex's connection."""
+        return KnowledgeGraph(self)
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get or create the SQLite connection."""
@@ -269,6 +290,24 @@ class SearchIndex:
 
         conn.commit()
 
+        # Initialize knowledge graph tables
+        kg = KnowledgeGraph(self)
+        kg.initialize()
+        self._graph_initialized = True
+
+    def _ensure_graph_initialized(self) -> None:
+        """Synchronously ensure graph tables exist.
+
+        Safe to call multiple times (uses CREATE TABLE IF NOT EXISTS).
+        Bypasses async initialize() to avoid event-loop issues in sync contexts.
+        """
+        if getattr(self, "_graph_initialized", False):
+            return
+        conn = self._get_conn()
+        kg = KnowledgeGraph(self)
+        kg.initialize()
+        self._graph_initialized = True
+
     def close(self) -> None:
         """Close the database connection."""
         if self._conn:
@@ -292,10 +331,10 @@ class SearchIndex:
             "SELECT content_hash FROM papers WHERE paper_id = ?", (paper_id,)
         ).fetchone()
 
-        if existing and existing["content_hash"] == content_hash:
-            return False  # No changes, skip update
+        content_changed = not existing or existing["content_hash"] != content_hash
 
-        # Parse nested fields
+        # Parse nested fields (always needed for papers upsert)
+        summary = paper.get("summary", {})
         summary = paper.get("summary", {})
         if isinstance(summary, dict):
             summary_json = json.dumps(summary, ensure_ascii=False)
@@ -384,28 +423,39 @@ class SearchIndex:
             ),
         )
 
-        # Rebuild FTS entry manually (triggers may not fire on INSERT OR REPLACE)
-        self._rebuild_fts_entry(conn, paper_id, paper, summary_json, topic, tags_json)
+        # Only rebuild FTS/embeddings when text content changed (optimization)
+        if content_changed:
+            # Rebuild FTS entry manually (triggers may not fire on INSERT OR REPLACE)
+            self._rebuild_fts_entry(conn, paper_id, paper, summary_json, topic, tags_json)
 
-        # Generate and store embedding if sqlite-vec is available and embedding is enabled
-        if self._sqlite_vec_available and self.embedding_client.is_enabled():
-            await self._upsert_embedding(conn, paper_id, paper, content_hash, now)
-        elif self._sqlite_vec_available and not self.embedding_client.is_enabled():
-            # Embedding was previously available but now unavailable
-            # Remove stale embeddings
-            conn.execute(
-                "DELETE FROM paper_embeddings WHERE paper_id = ?", (paper_id,)
-            )
-            if self._sqlite_vec_available:
-                try:
-                    conn.execute(
-                        "DELETE FROM paper_vectors WHERE paper_id = ?", (paper_id,)
-                    )
-                except Exception:
-                    pass
+            # Generate and store embedding if sqlite-vec is available and embedding is enabled
+            if self._sqlite_vec_available and self.embedding_client.is_enabled():
+                await self._upsert_embedding(conn, paper_id, paper, content_hash, now)
+            elif self._sqlite_vec_available and not self.embedding_client.is_enabled():
+                # Embedding was previously available but now unavailable
+                # Remove stale embeddings
+                conn.execute(
+                    "DELETE FROM paper_embeddings WHERE paper_id = ?", (paper_id,)
+                )
+                if self._sqlite_vec_available:
+                    try:
+                        conn.execute(
+                            "DELETE FROM paper_vectors WHERE paper_id = ?", (paper_id,)
+                        )
+                    except Exception:
+                        pass
 
         conn.commit()
-        return True
+
+        # Sync to knowledge graph (uses same conn — same transaction)
+        try:
+            self._ensure_graph_initialized()
+            kg = KnowledgeGraph(self)
+            kg.upsert_paper(paper)
+        except Exception as e:
+            logger.warning(f"Failed to sync paper {paper_id} to knowledge graph: {e}")
+
+        return content_changed
 
     def _rebuild_fts_entry(
         self,
@@ -706,6 +756,10 @@ class SearchIndex:
         if not candidates:
             return None
 
+        api_key = (self._config.embedding_api_key or "").strip()
+        if not api_key:
+            return None
+
         # Build rerank prompt
         papers_text = []
         for i, p in enumerate(candidates, 1):
@@ -739,7 +793,6 @@ Only output the JSON array, nothing else."""
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # Try to use dashscope or configured provider
                 api_base = self._config.embedding_api_base or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-                api_key = self._config.embedding_api_key or ""
 
                 payload = {
                     "model": "qwen-plus",

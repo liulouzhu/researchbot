@@ -29,6 +29,10 @@ class PaperSearchLocalTool(Tool):
     - year_from/year_to: year range
     - categories: any of the categories match
     - source: exact source match (arxiv, crossref, openalex)
+
+    Graph expansion (via knowledge graph):
+    - expand_via_citations: extend results along citation edges
+    - expand_depth: how many citation hops to traverse
     """
 
     name = "paper_search_local"
@@ -36,7 +40,8 @@ class PaperSearchLocalTool(Tool):
         "Search local papers using semantic search. "
         "Combines keyword and vector similarity for best results. "
         "Supports filtering by topic, tags, year, categories, and source. "
-        "Uses hybrid search with reranking when enabled."
+        "Uses hybrid search with reranking when enabled. "
+        "Optionally expands results via citation graph (cited/citing papers)."
     )
 
     parameters = {
@@ -88,6 +93,18 @@ class PaperSearchLocalTool(Tool):
                 "description": "Apply LLM reranking to top results",
                 "default": True,
             },
+            "expand_via_citations": {
+                "type": "boolean",
+                "description": "Expand results via citation graph (cited/citing papers)",
+                "default": False,
+            },
+            "expand_depth": {
+                "type": "integer",
+                "description": "Citation graph expansion depth (1-3, default 1)",
+                "minimum": 1,
+                "maximum": 3,
+                "default": 1,
+            },
         },
         "required": ["query"],
     }
@@ -138,11 +155,17 @@ class PaperSearchLocalTool(Tool):
         categories: list[str] | None = None,
         source: str | None = None,
         rerank: bool = True,
+        expand_via_citations: bool = False,
+        expand_depth: int = 1,
         **kwargs: Any,
     ) -> str:
         """Search local papers."""
         if not self._workspace:
             return "Error: workspace not configured"
+
+        query = (query or "").strip()
+        if not query:
+            return "Error: query must be a non-empty string"
 
         try:
             await self._ensure_initialized()
@@ -161,33 +184,84 @@ class PaperSearchLocalTool(Tool):
                 rerank=rerank,
             )
 
+            # Graph expansion via citation edges
+            expansion_note = ""
+            if expand_via_citations and results:
+                try:
+                    from researchbot.knowledge_graph import KnowledgeGraph
+
+                    kg = index.get_graph()
+                    expanded_ids: set[str] = set()
+
+                    # Collect cited and citing papers from initial results
+                    for r in results:
+                        pid = r.get("paper_id", "")
+                        if not pid:
+                            continue
+                        # Get outbound citations (papers this paper cites)
+                        cited = kg.get_cited_papers(pid, depth=expand_depth)
+                        for cp in cited:
+                            expanded_ids.add(cp)
+                        # Get inbound citations (papers that cite this paper)
+                        citing = kg.get_citing_papers(pid, depth=expand_depth)
+                        for cp in citing:
+                            expanded_ids.add(cp)
+
+                    if expanded_ids:
+                        # Fetch metadata for expanded papers
+                        expanded_papers = []
+                        for eid in expanded_ids:
+                            paper = index.get_paper(eid)
+                            if paper:
+                                paper["_expanded"] = True
+                                paper["final_score"] = 0.0
+                                paper["_expansion_source"] = r.get("paper_id", "")
+                                expanded_papers.append(paper)
+
+                        if expanded_papers:
+                            # Merge expanded papers into results (below initial results)
+                            results.extend(expanded_papers[:top_k])
+                            expansion_note = f" (+ {len(expanded_papers)} citation-expanded)"
+                except Exception:
+                    pass  # Don't fail if graph expansion fails
+
             if not results:
                 return f"No papers found for query: {query}\n\nTry broadening your search or removing filters."
 
             # Build output
+            search_mode = "hybrid (FTS5 + vector)" if index.sqlite_vec_available and index.embedding_client.available else "FTS5 keyword only"
+            if expansion_note:
+                search_mode += " + citation graph expansion"
+
             lines = [
                 f"Search results for: {query}\n",
-                f"Found {len(results)} result(s)\n",
-                f"Search mode: {'hybrid (FTS5 + vector)' if index.sqlite_vec_available and index.embedding_client.available else 'FTS5 keyword only'}\n",
+                f"Found {len(results)} result(s){expansion_note}\n",
+                f"Search mode: {search_mode}\n",
                 "-" * 60,
             ]
 
             for i, r in enumerate(results, 1):
                 paper_id = r.get("paper_id", "?")
                 title = r.get("title", "?")
-                year = r.get("year", "?")
-                source = r.get("source", "")
+                paper_year = r.get("year", "?")
+                paper_source = r.get("source", "")
                 final_score = r.get("final_score", 0)
                 lex_score = r.get("lexical_score", 0)
                 vec_score = r.get("vector_score", 0)
                 rerank_score = r.get("rerank_score")
+                is_expanded = r.get("_expanded", False)
+                expansion_src = r.get("_expansion_source", "")
 
-                lines.append(f"\n[{i}] {title}")
+                prefix = "[E] " if is_expanded else f"[{i}] "
+                lines.append(f"\n{prefix}{title}")
                 lines.append(f"    Paper ID: {paper_id}")
-                lines.append(f"    Year: {year} | Source: {source}")
-                lines.append(f"    Scores: final={final_score:.3f} lexical={lex_score:.3f} vector={vec_score:.3f}")
-                if rerank_score is not None:
-                    lines.append(f"    Rerank score: {rerank_score}")
+                lines.append(f"    Year: {paper_year} | Source: {paper_source}")
+                if is_expanded and expansion_src:
+                    lines.append(f"    (via citation from {expansion_src})")
+                if not is_expanded:
+                    lines.append(f"    Scores: final={final_score:.3f} lexical={lex_score:.3f} vector={vec_score:.3f}")
+                    if rerank_score is not None:
+                        lines.append(f"    Rerank score: {rerank_score}")
 
                 # Show matched filters if any
                 filters = r.get("matched_filters", {})
@@ -328,3 +402,318 @@ class PaperIndexTool(Tool):
                 return f"Paper unchanged (skipped): {paper_id}"
 
         return "Error: specify paper_id or rebuild=True"
+
+
+class GraphQueryTool(Tool):
+    """Query the local knowledge graph for paper relationships.
+
+    Provides citation analysis, co-authorship discovery, concept relationships,
+    and path finding between papers — all from locally stored data.
+    """
+
+    name = "graph_query"
+    description = (
+        "Query the local knowledge graph for paper citation relationships, "
+        "co-authors, concept connections, and paths between papers. "
+        "Use this instead of external APIs when you have papers indexed locally. "
+        "Call this tool after finding relevant papers to understand their relationships."
+    )
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "description": "Graph operation to perform",
+                "enum": [
+                    "get_citing_papers",
+                    "get_cited_papers",
+                    "get_papers_by_concept",
+                    "get_co_authors",
+                    "get_concept_neighbors",
+                    "find_common_citations",
+                    "find_path",
+                    "get_related_papers",
+                    "stats",
+                ],
+            },
+            "paper_id": {
+                "type": "string",
+                "description": "Paper ID for citation/co-author queries",
+            },
+            "concept_id": {
+                "type": "string",
+                "description": "Concept ID for concept-related queries",
+            },
+            "author_id": {
+                "type": "string",
+                "description": "Author ID for co-author queries (e.g. 'vaswani_a')",
+            },
+            "paper_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of paper IDs for common citations or path queries",
+            },
+            "paper_a": {
+                "type": "string",
+                "description": "Source paper ID for path finding",
+            },
+            "paper_b": {
+                "type": "string",
+                "description": "Target paper ID for path finding",
+            },
+            "depth": {
+                "type": "integer",
+                "description": "Graph traversal depth (1-3, default 1)",
+                "minimum": 1,
+                "maximum": 3,
+                "default": 1,
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Maximum results to return",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 20,
+            },
+        },
+        "required": ["operation"],
+    }
+
+    def __init__(
+        self,
+        workspace: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
+    ):
+        self._workspace = Path(workspace) if workspace else None
+        self._semantic_config = semantic_config or SemanticSearchConfig()
+        self._index: SearchIndex | None = None
+        self._kg_initialized = False
+
+    def _resolve_path(self, path: str) -> Path:
+        p = Path(path)
+        if not p.is_absolute() and self._workspace:
+            p = self._workspace / p
+        return p
+
+    def _get_graph(self):
+        """Get or create the knowledge graph (sync, no await needed)."""
+        if self._index is None:
+            db_path = self._resolve_path(self._semantic_config.sqlite_db_path)
+            self._index = SearchIndex(db_path, self._semantic_config)
+        # Ensure graph tables exist (sync, idempotent)
+        self._index._ensure_graph_initialized()
+        from researchbot.knowledge_graph import KnowledgeGraph
+        return KnowledgeGraph(self._index)
+
+    def _load_paper_metadata(self, paper_ids: list[str]) -> dict[str, dict]:
+        """Load title/year for a list of paper IDs."""
+        if not self._index:
+            return {}
+        conn = self._index._get_conn()
+        placeholders = ",".join("?" * len(paper_ids))
+        rows = conn.execute(
+            f"SELECT paper_id, title, year FROM papers WHERE paper_id IN ({placeholders})",
+            paper_ids,
+        ).fetchall()
+        return {r["paper_id"]: dict(r) for r in rows}
+
+    def _paper_exists(self, paper_id: str) -> bool:
+        """Check whether a paper exists in local storage/index."""
+        if not self._index or not paper_id:
+            return False
+        conn = self._index._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM papers WHERE paper_id = ? LIMIT 1",
+            (paper_id,),
+        ).fetchone()
+        return row is not None
+
+    def execute(
+        self,
+        operation: str,
+        paper_id: str | None = None,
+        concept_id: str | None = None,
+        author_id: str | None = None,
+        paper_ids: list[str] | None = None,
+        paper_a: str | None = None,
+        paper_b: str | None = None,
+        depth: int = 1,
+        top_k: int = 20,
+        **kwargs: Any,
+    ) -> str:
+        """Query the knowledge graph."""
+        if not self._workspace:
+            return "Error: workspace not configured"
+
+        try:
+            kg = self._get_graph()
+
+            if operation == "stats":
+                s = kg.stats()
+                return (
+                    f"Knowledge Graph Stats:\n"
+                    f"  Concepts: {s['concepts']}\n"
+                    f"  Authors: {s['authors']}\n"
+                    f"  Citation edges: {s['citation_edges']}\n"
+                    f"  Paper-concept edges: {s['paper_concept_edges']}\n"
+                    f"  Author collaborations: {s['author_collaborations']}\n"
+                    f"  Paper related edges: {s['paper_related_edges']}"
+                )
+
+            if operation == "get_citing_papers":
+                if not paper_id:
+                    return "Error: paper_id is required for get_citing_papers"
+                ids = kg.get_citing_papers(paper_id, depth=depth)
+                if not ids:
+                    if not self._paper_exists(paper_id):
+                        return (
+                            f"Paper '{paper_id}' is not indexed in local papers/graph. "
+                            "Index or save the paper first (e.g., paper_get + paper_save/paper_enrich), "
+                            "then run graph_query again."
+                        )
+                    return f"No citing papers found for {paper_id}"
+                meta = self._load_paper_metadata(ids)
+                lines = [f"Papers that cite '{paper_id}' (depth={depth}):\n"]
+                for i, pid in enumerate(ids[:top_k], 1):
+                    m = meta.get(pid, {})
+                    title = m.get("title", pid)
+                    year = m.get("year", "?")
+                    lines.append(f"  {i}. {title} ({year}) [{pid}]")
+                return "\n".join(lines)
+
+            if operation == "get_cited_papers":
+                if not paper_id:
+                    return "Error: paper_id is required for get_cited_papers"
+                ids = kg.get_cited_papers(paper_id, depth=depth)
+                if not ids:
+                    if not self._paper_exists(paper_id):
+                        return (
+                            f"Paper '{paper_id}' is not indexed in local papers/graph. "
+                            "Index or save the paper first (e.g., paper_get + paper_save/paper_enrich), "
+                            "then run graph_query again."
+                        )
+                    return f"No cited papers found for {paper_id}"
+                meta = self._load_paper_metadata(ids)
+                lines = [f"Papers cited by '{paper_id}' (depth={depth}):\n"]
+                for i, pid in enumerate(ids[:top_k], 1):
+                    m = meta.get(pid, {})
+                    title = m.get("title", pid)
+                    year = m.get("year", "?")
+                    lines.append(f"  {i}. {title} ({year}) [{pid}]")
+                return "\n".join(lines)
+
+            if operation == "get_related_papers":
+                if not paper_id:
+                    return "Error: paper_id is required for get_related_papers"
+                ids = kg.get_related_papers(paper_id, depth=depth)
+                if not ids:
+                    return f"No related papers found for {paper_id}"
+                meta = self._load_paper_metadata(ids)
+                lines = [f"Papers related to '{paper_id}' (depth={depth}):\n"]
+                for i, pid in enumerate(ids[:top_k], 1):
+                    m = meta.get(pid, {})
+                    title = m.get("title", pid)
+                    year = m.get("year", "?")
+                    lines.append(f"  {i}. {title} ({year}) [{pid}]")
+                return "\n".join(lines)
+
+            if operation == "get_papers_by_concept":
+                if not concept_id:
+                    return "Error: concept_id is required for get_papers_by_concept"
+                results = kg.get_papers_by_concept(concept_id, top_k=top_k)
+                if not results:
+                    return f"No papers found for concept: {concept_id}"
+                paper_ids_list = [pid for pid, _ in results]
+                meta = self._load_paper_metadata(paper_ids_list)
+                lines = [f"Papers tagged with concept '{concept_id}':\n"]
+                for i, (pid, score) in enumerate(results[:top_k], 1):
+                    m = meta.get(pid, {})
+                    title = m.get("title", pid)
+                    lines.append(f"  {i}. {title} (score={score:.2f}) [{pid}]")
+                return "\n".join(lines)
+
+            if operation == "get_co_authors":
+                if not author_id:
+                    return "Error: author_id is required for get_co_authors (e.g. 'vaswani_a')"
+                results = kg.get_co_authors(author_id, top_k=top_k)
+                if not results:
+                    return f"No co-authors found for: {author_id}"
+                # Get author display names
+                conn = self._index._get_conn()
+                aids = [aid for aid, _ in results]
+                placeholders = ",".join("?" * len(aids))
+                rows = conn.execute(
+                    f"SELECT author_id, display_name FROM authors WHERE author_id IN ({placeholders})",
+                    aids,
+                ).fetchall()
+                name_map = {r["author_id"]: r["display_name"] for r in rows}
+                lines = [f"Co-authors of '{name_map.get(author_id, author_id)}' (author_id={author_id}):\n"]
+                for i, (aid, count) in enumerate(results[:top_k], 1):
+                    name = name_map.get(aid, aid)
+                    lines.append(f"  {i}. {name} (collaborated on {count} paper(s)) [{aid}]")
+                return "\n".join(lines)
+
+            if operation == "get_concept_neighbors":
+                if not concept_id:
+                    return "Error: concept_id is required for get_concept_neighbors"
+                results = kg.get_concept_neighbors(concept_id, top_k=top_k)
+                if not results:
+                    return f"No neighboring concepts found for: {concept_id}"
+                conn = self._index._get_conn()
+                cids = [cid for cid, _ in results]
+                placeholders = ",".join("?" * len(cids))
+                rows = conn.execute(
+                    f"SELECT concept_id, display_name FROM concepts WHERE concept_id IN ({placeholders})",
+                    cids,
+                ).fetchall()
+                name_map = {r["concept_id"]: r["display_name"] for r in rows}
+                lines = [f"Concepts co-occurring with '{name_map.get(concept_id, concept_id)}':\n"]
+                for i, (cid, cnt) in enumerate(results[:top_k], 1):
+                    name = name_map.get(cid, cid)
+                    lines.append(f"  {i}. {name} (co-occurred in {cnt} papers) [{cid}]")
+                return "\n".join(lines)
+
+            if operation == "find_common_citations":
+                if not paper_ids or len(paper_ids) < 2:
+                    return "Error: paper_ids (list of 2+ paper IDs) is required for find_common_citations"
+                results = kg.find_common_citations(paper_ids)
+                if not results:
+                    return "No common citations found among the given papers."
+                paper_ids_list = [pid for pid, _ in results]
+                meta = self._load_paper_metadata(paper_ids_list)
+                lines = [f"Papers commonly cited by all {len(paper_ids)} papers:\n"]
+                for i, (pid, _) in enumerate(results[:top_k], 1):
+                    m = meta.get(pid, {})
+                    title = m.get("title", pid)
+                    lines.append(f"  {i}. {title} [{pid}]")
+                return "\n".join(lines)
+
+            if operation == "find_path":
+                if not paper_a or not paper_b:
+                    return "Error: paper_a and paper_b are required for find_path"
+                path = kg.find_path(paper_a, paper_b, max_depth=depth)
+                if path is None:
+                    return f"No citation path found between '{paper_a}' and '{paper_b}' within depth={depth}"
+                # Load metadata for all papers in path
+                all_ids = []
+                for p in path:
+                    all_ids.extend(p)
+                all_ids = list(dict.fromkeys(all_ids))  # dedupe preserving order
+                meta = self._load_paper_metadata(all_ids)
+                lines = [f"Citation path from '{meta.get(paper_a, {}).get('title', paper_a)}' to '{meta.get(paper_b, {}).get('title', paper_b)}':\n"]
+                for pi, pids in enumerate(path, 1):
+                    step_lines = []
+                    for i, pid in enumerate(pids):
+                        m = meta.get(pid, {})
+                        title = m.get("title", pid)
+                        year = m.get("year", "?")
+                        step_lines.append(f"    {'→' if i > 0 else ''}{title} ({year}) [{pid}]")
+                    lines.append(f"  Path {pi}:")
+                    lines.extend(step_lines)
+                return "\n".join(lines)
+
+            return f"Unknown operation: {operation}"
+
+        except Exception as e:
+            return f"Graph query error: {e}"

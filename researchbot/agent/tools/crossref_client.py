@@ -185,8 +185,8 @@ async def search_crossref(
 
     proxies = proxy or None
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(url, params=params, headers=headers, proxies=proxies)
+    async with httpx.AsyncClient(timeout=timeout, proxy=proxies) as client:
+        response = await client.get(url, params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
 
@@ -218,9 +218,9 @@ async def get_crossref_work(
 
     url = f"{CROSSREF_API_BASE}/works/{doi}"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, proxy=proxies) as client:
         try:
-            response = await client.get(url, headers=headers, proxies=proxies)
+            response = await client.get(url, headers=headers)
             if response.status_code == 404:
                 return None
             response.raise_for_status()

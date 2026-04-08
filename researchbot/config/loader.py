@@ -15,8 +15,6 @@ _current_config_path: Path | None = None
 # New default paths
 _NEW_CONFIG_DIR = Path.home() / ".researchbot"
 _NEW_CONFIG_FILE = _NEW_CONFIG_DIR / "config.json"
-_OLD_CONFIG_DIR = Path.home() / ".nanobot"
-_OLD_CONFIG_FILE = _OLD_CONFIG_DIR / "config.json"
 
 
 def set_config_path(path: Path) -> None:
@@ -30,6 +28,7 @@ def _migrate_from_old_location() -> bool:
 
     Returns True if migration was performed.
     """
+    _OLD_CONFIG_DIR = Path.home() / ".nanobot"
     if _NEW_CONFIG_DIR.exists():
         # New location already exists, no migration needed
         return False
@@ -67,8 +66,7 @@ def get_config_path() -> Path:
         return _NEW_CONFIG_FILE
 
     # If new doesn't exist but old does, migrate
-    if _OLD_CONFIG_FILE.exists():
-        _migrate_from_old_location()
+    if _migrate_from_old_location():
         return _NEW_CONFIG_FILE
 
     # Neither exists, return new default

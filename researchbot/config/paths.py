@@ -11,7 +11,6 @@ from researchbot.utils.helpers import ensure_dir
 _NEW_CONFIG_DIR = Path.home() / ".researchbot"
 _NEW_WORKSPACE = _NEW_CONFIG_DIR / "workspace"
 _NEW_BRIDGE = _NEW_CONFIG_DIR / "bridge"
-_OLD_CONFIG_DIR = Path.home() / ".nanobot"
 
 
 def get_data_dir() -> Path:
@@ -72,4 +71,4 @@ def get_bridge_install_dir() -> Path:
 
 def get_legacy_sessions_dir() -> Path:
     """Return the legacy global session directory used for migration fallback."""
-    return _OLD_CONFIG_DIR / "sessions"
+    return _NEW_CONFIG_DIR / "sessions"

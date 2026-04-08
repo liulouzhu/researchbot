@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,6 +17,7 @@ _DEFAULT_MAX_ITERATIONS_MESSAGE = (
     "without completing the task. You can try breaking the task into smaller steps."
 )
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
+_REPEATED_TOOL_CALL_LIMIT = 4
 
 
 @dataclass(slots=True)
@@ -55,6 +57,18 @@ class AgentRunner:
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
+    @staticmethod
+    def _tool_calls_signature(tool_calls: list[ToolCallRequest]) -> str:
+        """Build a stable signature for a batch of tool calls."""
+        parts: list[str] = []
+        for tc in tool_calls:
+            try:
+                args = json.dumps(tc.arguments, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                args = str(tc.arguments)
+            parts.append(f"{tc.name}:{args}")
+        return "||".join(parts)
+
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
@@ -64,6 +78,8 @@ class AgentRunner:
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
+        last_tool_signature: str | None = None
+        repeated_tool_rounds = 0
 
         for iteration in range(spec.max_iterations):
             context = AgentHookContext(iteration=iteration, messages=messages)
@@ -107,6 +123,24 @@ class AgentRunner:
 
                 effective_tool_calls = list(context.tool_calls) if context.tool_calls else list(response.tool_calls)
 
+                tool_signature = self._tool_calls_signature(effective_tool_calls)
+                if tool_signature and tool_signature == last_tool_signature:
+                    repeated_tool_rounds += 1
+                else:
+                    repeated_tool_rounds = 1
+                    last_tool_signature = tool_signature
+
+                if repeated_tool_rounds >= _REPEATED_TOOL_CALL_LIMIT:
+                    stop_reason = "repeated_tool_calls"
+                    final_content = (
+                        "I am repeatedly calling the same tool without making progress. "
+                        "Please refine the request or tell me the next exact step to execute."
+                    )
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    break
+
                 messages.append(build_assistant_message(
                     response.content or "",
                     tool_calls=[tc.to_openai_tool_call() for tc in effective_tool_calls],
@@ -126,6 +160,13 @@ class AgentRunner:
                     context.stop_reason = stop_reason
                     await hook.after_iteration(context)
                     break
+
+                # If we have already sent a user-facing message, end this run early
+                # to avoid accidental follow-up tool loops in the same turn.
+                message_sent = any(
+                    event.get("name") == "message" and event.get("status") == "ok"
+                    for event in new_events
+                )
                 for tool_call, result in zip(effective_tool_calls, results):
                     messages.append({
                         "role": "tool",
@@ -133,6 +174,13 @@ class AgentRunner:
                         "name": tool_call.name,
                         "content": result,
                     })
+
+                if message_sent:
+                    stop_reason = "message_sent"
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    break
+
                 await hook.after_iteration(context)
                 continue
 

@@ -278,6 +278,7 @@ class AgentLoop:
         from researchbot.agent.tools.paper_search_local import (
             PaperSearchLocalTool,
             PaperIndexTool,
+            GraphQueryTool,
         )
         from researchbot.agent.tools.paper_cite import PaperCiteTool
         from researchbot.agent.tools.innovation import InnovationWorkflowTool
@@ -317,6 +318,10 @@ class AgentLoop:
             semantic_config=semantic_config,
         ))
         self.tools.register(PaperIndexTool(
+            workspace=str(self.workspace),
+            semantic_config=semantic_config,
+        ))
+        self.tools.register(GraphQueryTool(
             workspace=str(self.workspace),
             semantic_config=semantic_config,
         ))
