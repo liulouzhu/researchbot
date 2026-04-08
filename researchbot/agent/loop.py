@@ -275,6 +275,7 @@ class AgentLoop:
             CrossrefSearchTool,
             OpenAlexSearchTool,
         )
+        from researchbot.agent.tools.concept_explore import ConceptExploreTool
         from researchbot.agent.tools.paper_search_local import (
             PaperSearchLocalTool,
             PaperIndexTool,
@@ -309,6 +310,12 @@ class AgentLoop:
             openalex_api_key=openalex_api_key,
             workspace=str(self.workspace),
             semantic_config=semantic_config,
+            proxy=self.web_proxy,
+        ))
+        self.tools.register(ConceptExploreTool(
+            workspace=str(self.workspace),
+            semantic_config=semantic_config,
+            openalex_api_key=openalex_api_key,
             proxy=self.web_proxy,
         ))
 
