@@ -45,6 +45,33 @@ def _get_kg_and_index(workspace: str | None, semantic_config: SemanticSearchConf
     return kg, index
 
 
+def _get_paper_metadata(
+    paper_id: str,
+    index: SearchIndex | None,
+    kg: KnowledgeGraph | None,
+    fields: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Fetch paper metadata: try index.get_paper() first, fall back to raw SQL."""
+    if index:
+        p = index.get_paper(paper_id)
+        if p:
+            return p
+    if kg:
+        conn = kg._conn()
+        cols = ", ".join(fields) if fields else "paper_id, title, year, citation_count, cited_by_count"
+        row = conn.execute(f"SELECT {cols} FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
+        if row:
+            result = dict(row)
+            # Parse authors_json if present
+            if "authors_json" in result and result["authors_json"]:
+                try:
+                    result["authors"] = json.loads(result["authors_json"])
+                except Exception:
+                    result["authors"] = []
+            return result
+    return None
+
+
 async def _map_topic_to_concepts(
     topic: str,
     kg: KnowledgeGraph | None,
@@ -277,12 +304,7 @@ class ConceptExploreTool(Tool):
             "concept_ids": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Concept IDs to track (for track_concepts)",
-            },
-            "depth": {
-                "type": "integer",
-                "description": "Exploration depth (default 2)",
-                "default": 2,
+                "description": "Concept IDs to track (for track_concepts), or concept to explore directly (for explore_topic)",
             },
             "top_k": {
                 "type": "integer",
@@ -319,14 +341,15 @@ class ConceptExploreTool(Tool):
         topic: str | None = None,
         paper_id: str | None = None,
         concept_ids: list[str] | None = None,
-        depth: int = 2,
         top_k: int = 10,
         **kwargs: Any,
     ) -> str:
         if action == "explore_topic":
-            return await self._explore_topic(topic or "", depth, top_k)
+            if concept_ids:
+                return await self._resume_exploration(concept_ids[0])
+            return await self._explore_topic(topic or "", top_k)
         elif action == "explore_paper":
-            return await self._explore_paper(paper_id or "", depth, top_k)
+            return await self._explore_paper(paper_id or "", top_k)
         elif action == "track_concepts":
             return await self._track_concepts(concept_ids or [])
         elif action == "list_tracks":
@@ -336,7 +359,19 @@ class ConceptExploreTool(Tool):
         else:
             return f"Unknown action: {action}"
 
-    async def _explore_topic(self, topic: str, depth: int, top_k: int) -> str:
+    async def _resume_exploration(self, concept_id: str) -> str:
+        """Resume exploration at a specific concept (drill-down continuation)."""
+        kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
+        if kg is None:
+            return "Error: Knowledge graph not available."
+        conn = kg._conn()
+        row = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (concept_id,)).fetchone()
+        if not row:
+            return f"Error: concept '{concept_id}' not found in local graph."
+        concept_name = row["display_name"]
+        return await self._start_concept_exploration(concept_id, concept_name, top_k=top_k)
+
+    async def _explore_topic(self, topic: str, top_k: int) -> str:
         """Map topic to concepts and start interactive exploration."""
         kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
         if kg is None:
@@ -370,11 +405,11 @@ class ConceptExploreTool(Tool):
         # Auto-select if only one concept
         if len(concepts) == 1:
             c = concepts[0]
-            return await self._start_concept_exploration(c["id"], c["display_name"], depth, top_k)
+            return await self._start_concept_exploration(c["id"], c["display_name"], top_k)
 
         return "\n".join(lines)
 
-    async def _start_concept_exploration(self, concept_id: str, concept_name: str, depth: int, top_k: int) -> str:
+    async def _start_concept_exploration(self, concept_id: str, concept_name: str, top_k: int) -> str:
         """Begin exploration at a specific concept."""
         kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
         if kg is None:
@@ -393,20 +428,9 @@ class ConceptExploreTool(Tool):
         paper_scores = kg.get_papers_by_concept(concept_id, top_k=top_k)
         papers = []
         for pid, score in paper_scores:
-            if index:
-                p = index.get_paper(pid)
-                if p:
-                    papers.append(p)
-            if not papers:
-                conn = kg._conn()
-                row = conn.execute("SELECT title, year, citation_count FROM papers WHERE paper_id = ?", (pid,)).fetchone()
-                if row:
-                    papers.append({
-                        "paper_id": pid,
-                        "title": row["title"],
-                        "year": row["year"],
-                        "citation_count": row["citation_count"],
-                    })
+            p = _get_paper_metadata(pid, index, kg)
+            if p:
+                papers.append(p)
 
         # Save context
         self._ctx.push(concept_id, concept_name, neighbor_details, papers)
@@ -430,7 +454,7 @@ class ConceptExploreTool(Tool):
 
         return "\n".join(lines)
 
-    async def _explore_paper(self, paper_id: str, depth: int, top_k: int) -> str:
+    async def _explore_paper(self, paper_id: str, top_k: int) -> str:
         """Explore concept network starting from a paper."""
         kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
         if kg is None:
@@ -440,28 +464,7 @@ class ConceptExploreTool(Tool):
             return "Error: paper_id is required for explore_paper."
 
         # Get paper metadata
-        paper = None
-        if index:
-            paper = index.get_paper(paper_id)
-        if not paper:
-            conn = kg._conn()
-            row = conn.execute(
-                "SELECT title, year, authors_json FROM papers WHERE paper_id = ?", (paper_id,)
-            ).fetchone()
-            if row:
-                import json as _json
-                authors = []
-                try:
-                    authors = _json.loads(row["authors_json"]) if row["authors_json"] else []
-                except Exception:
-                    pass
-                paper = {
-                    "paper_id": paper_id,
-                    "title": row["title"],
-                    "year": row["year"],
-                    "authors": authors,
-                }
-
+        paper = _get_paper_metadata(paper_id, index, kg, fields=["title", "year", "authors_json", "citation_count", "cited_by_count"])
         if not paper:
             return f"Error: Paper '{paper_id}' not found. Check the paper ID and try again."
 
