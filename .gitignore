@@ -1,0 +1,7 @@
+.claude/
+.pytest_cache/
+.venv/
+tests/
+__pycache__/
+ARIS/
+docs/

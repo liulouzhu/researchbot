@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from loguru import logger
 
 from researchbot.agent.tools.base import Tool
 from researchbot.agent.tools.openalex_client import search_openalex_concepts
@@ -100,13 +97,15 @@ async def _map_topic_to_concepts(
                 "source": "local",
                 "paper_count": 0,
             }
-        # Get paper counts
-        for cid in candidates:
-            row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM paper_concepts WHERE concept_id = ?",
-                (cid,),
-            ).fetchone()
-            candidates[cid]["paper_count"] = row["cnt"] if row else 0
+        # Get paper counts in one batch
+        if candidates:
+            placeholders = ",".join("?" * len(candidates))
+            count_rows = conn.execute(
+                f"SELECT concept_id, COUNT(*) as cnt FROM paper_concepts WHERE concept_id IN ({placeholders}) GROUP BY concept_id",
+                list(candidates.keys()),
+            ).fetchall()
+            for row in count_rows:
+                candidates[row["concept_id"]]["paper_count"] = row["cnt"]
 
     # 2. Supplement from OpenAlex if local results < 3
     if len(candidates) < 3:
@@ -176,15 +175,6 @@ class ConceptTrackStore:
             })
         self._save(data)
 
-    def update_last_checked(self, concept_id: str, new_count: int) -> None:
-        data = self._load()
-        for t in data["tracks"]:
-            if t["id"] == concept_id:
-                t["last_checked_at"] = datetime.now(timezone.utc).isoformat()
-                t["last_new_count"] = new_count
-                break
-        self._save(data)
-
     def remove(self, concept_id: str) -> bool:
         data = self._load()
         original_len = len(data["tracks"])
@@ -205,18 +195,14 @@ class ExplorationContext:
 
     def __init__(self) -> None:
         self.stack: list[dict[str, Any]] = []
-        self.current_concept_id: str = ""
-        self.current_concept_name: str = ""
 
     def push(self, concept_id: str, concept_name: str, neighbors: list[dict[str, Any]], papers: list[dict[str, Any]]) -> None:
         self.stack.append({
             "concept_id": concept_id,
             "concept_name": concept_name,
-            "neighbors": neighbors,  # [{id, name, co_count}]
-            "papers": papers,         # [{paper_id, title, year, cited_by_count}]
+            "neighbors": neighbors,
+            "papers": papers,
         })
-        self.current_concept_id = concept_id
-        self.current_concept_name = concept_name
         self._save()
 
     def pop(self) -> dict[str, Any] | None:
@@ -224,19 +210,10 @@ class ExplorationContext:
             return None
         self.stack.pop()
         self._save()
-        if self.stack:
-            top = self.stack[-1]
-            self.current_concept_id = top["concept_id"]
-            self.current_concept_name = top["concept_name"]
-        else:
-            self.current_concept_id = ""
-            self.current_concept_name = ""
-        return top if self.stack else None
+        return self.stack[-1] if self.stack else None
 
     def clear(self) -> None:
         self.stack = []
-        self.current_concept_id = ""
-        self.current_concept_name = ""
         self._save()
 
     def is_empty(self) -> bool:
@@ -244,13 +221,8 @@ class ExplorationContext:
 
     def _save(self) -> None:
         EXPLORATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "stack": self.stack,
-            "current_concept_id": self.current_concept_id,
-            "current_concept_name": self.current_concept_name,
-        }
         with open(EXPLORATION_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump({"stack": self.stack}, f, ensure_ascii=False, indent=2)
 
     @classmethod
     def load(cls) -> "ExplorationContext":
@@ -262,8 +234,6 @@ class ExplorationContext:
             with open(EXPLORATION_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             ctx.stack = data.get("stack", [])
-            ctx.current_concept_id = data.get("current_concept_id", "")
-            ctx.current_concept_name = data.get("current_concept_name", "")
             return ctx
         except (json.JSONDecodeError, IOError):
             return ctx
@@ -328,12 +298,6 @@ class ConceptExploreTool(Tool):
         self._proxy = proxy
         self._track_store = ConceptTrackStore()
         self._ctx = ExplorationContext.load()
-
-    def _resolve_path(self, path: str) -> Path:
-        p = Path(path)
-        if not p.is_absolute() and self._workspace:
-            p = Path(self._workspace) / p
-        return p
 
     async def execute(
         self,
@@ -417,12 +381,20 @@ class ConceptExploreTool(Tool):
 
         # Get neighbors
         neighbors = kg.get_concept_neighbors(concept_id, top_k=top_k)
-        neighbor_details = []
-        for nid, cnt in neighbors:
-            conn = kg._conn()
-            row = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (nid,)).fetchone()
-            name = row["display_name"] if row else nid
-            neighbor_details.append({"id": nid, "name": name, "co_count": cnt})
+        # Batch-fetch neighbor names to avoid N+1
+        neighbor_ids = [nid for nid, _ in neighbors]
+        name_map = {}
+        if neighbor_ids:
+            placeholders = ",".join("?" * len(neighbor_ids))
+            rows = kg._conn().execute(
+                f"SELECT concept_id, display_name FROM concepts WHERE concept_id IN ({placeholders})",
+                neighbor_ids,
+            ).fetchall()
+            name_map = {r["concept_id"]: r["display_name"] for r in rows}
+        neighbor_details = [
+            {"id": nid, "name": name_map.get(nid, nid), "co_count": cnt}
+            for nid, cnt in neighbors
+        ]
 
         # Get representative papers
         paper_scores = kg.get_papers_by_concept(concept_id, top_k=top_k)
@@ -473,24 +445,53 @@ class ConceptExploreTool(Tool):
         if not concept_ids:
             return f"Paper '{paper_id}' has no concept tags in the graph. Enrich it with paper_enrich first."
 
-        # Get concept details and their neighbors
+        # Batch-fetch all concept display names
+        concept_placeholders = ",".join("?" * len(concept_ids))
+        concept_name_rows = kg._conn().execute(
+            f"SELECT concept_id, display_name FROM concepts WHERE concept_id IN ({concept_placeholders})",
+            concept_ids,
+        ).fetchall()
+        concept_name_map = {r["concept_id"]: r["display_name"] for r in concept_name_rows}
+
+        # Batch-fetch paper counts for all concepts
+        count_rows = kg._conn().execute(
+            f"SELECT concept_id, COUNT(*) as cnt FROM paper_concepts WHERE concept_id IN ({concept_placeholders}) GROUP BY concept_id",
+            concept_ids,
+        ).fetchall()
+        count_map = {r["concept_id"]: r["cnt"] for r in count_rows}
+
+        # Collect all neighbor IDs across all concepts for batch name lookup
+        all_neighbor_ids: set[str] = set()
         concept_details = []
         for cid in concept_ids:
-            conn = kg._conn()
-            row = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (cid,)).fetchone()
-            name = row["display_name"] if row else cid
-            paper_count = len(kg.get_papers_by_concept(cid, top_k=1000))
+            name = concept_name_map.get(cid, cid)
+            paper_count = count_map.get(cid, 0)
             neighbors = kg.get_concept_neighbors(cid, top_k=5)
-            neighbor_details = []
-            for nid, cnt in neighbors:
-                nr = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (nid,)).fetchone()
-                neighbor_details.append({"id": nid, "name": nr["display_name"] if nr else nid, "co_count": cnt})
+            for nid, _ in neighbors:
+                all_neighbor_ids.add(nid)
             concept_details.append({
                 "id": cid,
                 "name": name,
                 "paper_count": paper_count,
-                "neighbors": neighbor_details,
+                "neighbors": neighbors,
             })
+
+        # Batch-fetch all neighbor names
+        neighbor_name_map = {}
+        if all_neighbor_ids:
+            n_placeholders = ",".join("?" * len(all_neighbor_ids))
+            n_rows = kg._conn().execute(
+                f"SELECT concept_id, display_name FROM concepts WHERE concept_id IN ({n_placeholders})",
+                list(all_neighbor_ids),
+            ).fetchall()
+            neighbor_name_map = {r["concept_id"]: r["display_name"] for r in n_rows}
+
+        # Fill in neighbor names
+        for cd in concept_details:
+            cd["neighbors"] = [
+                {"id": nid, "name": neighbor_name_map.get(nid, nid), "co_count": cnt}
+                for nid, cnt in cd["neighbors"]
+            ]
 
         # Find common citations across all concepts
         if len(concept_ids) > 1:
