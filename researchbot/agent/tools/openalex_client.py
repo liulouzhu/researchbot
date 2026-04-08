@@ -263,6 +263,46 @@ async def search_openalex(
     return [_parse_openalex_work(item) for item in results]
 
 
+async def search_openalex_concepts(
+    query: str,
+    api_key: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    proxy: str | None = None,
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    """Search OpenAlex concepts by keyword.
+
+    Returns list of concept dicts with keys: id, display_name, level, wikipedia_url, paper_count
+    """
+    base_url = f"{OPENALEX_API_BASE}/concepts"
+    params = {
+        "search": query,
+        "per-page": top_k,
+    }
+    params["mailto"] = "researchbot@example.com"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    proxies = proxy or None
+
+    async with httpx.AsyncClient(timeout=timeout, proxy=proxies) as client:
+        response = await client.get(base_url, params=params, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+
+    results = []
+    for item in data.get("results", []):
+        results.append({
+            "id": item.get("id", ""),
+            "display_name": item.get("display_name", ""),
+            "level": item.get("level", 0),
+            "wikipedia_url": item.get("wikipedia_url") or "",
+            "paper_count": item.get("paper_count", 0),
+        })
+    return results
+
+
 async def get_openalex_work(
     identifier: str,
     api_key: str | None = None,
