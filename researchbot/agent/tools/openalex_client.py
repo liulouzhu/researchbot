@@ -329,12 +329,17 @@ async def get_openalex_work(
 
     proxies = proxy or None
 
-    # Check if it's a DOI (starts with 10.)
+    # Strip common prefixes
     clean_id = identifier.replace("https://doi.org/", "").replace("https://openalex.org/", "")
-    if not clean_id.startswith("W"):
-        identifier = clean_id
 
-    url = f"{OPENALEX_API_BASE}/works/{identifier}"
+    if clean_id.startswith("W"):
+        # OpenAlex ID - use directly
+        url = f"{OPENALEX_API_BASE}/works/{clean_id}"
+    else:
+        # DOI - must be formatted as https://doi.org/{doi} and URL-encoded
+        import urllib.parse
+        encoded_doi = urllib.parse.quote(clean_id, safe="")
+        url = f"{OPENALEX_API_BASE}/works/https://doi.org/{encoded_doi}"
 
     async with httpx.AsyncClient(timeout=timeout, proxy=proxies) as client:
         try:

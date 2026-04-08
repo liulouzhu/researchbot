@@ -272,6 +272,28 @@ async def enrich_arxiv_paper(
     authors = result.get("authors", [])
     year = result.get("year", "")
 
+    # Validate existing DOI: if title/authors are available, verify the DOI resolves to a matching paper
+    if doi and title:
+        try:
+            validated = await enrich_paper_by_doi(
+                doi=doi,
+                existing_paper=None,
+                crossref_mailto=crossref_mailto,
+                openalex_api_key=openalex_api_key,
+                timeout=timeout,
+                proxy=proxy,
+            )
+            if validated.get("title"):
+                # Check title word overlap
+                title_words = set(title.lower().split()) - {"the", "a", "an", "of", "and", "in", "for", "to", "by"}
+                validated_words = set(validated["title"].lower().split()) - {"the", "a", "an", "of", "and", "in", "for", "to", "by"}
+                overlap = title_words & validated_words
+                # If fewer than 30% of title words match, the DOI is likely wrong
+                if len(title_words) > 0 and len(overlap) / len(title_words) < 0.3:
+                    doi = ""  # Discard wrong DOI, will re-search
+        except Exception:
+            doi = ""  # Discard invalid DOI on error
+
     if not doi and title:
         # Try to find DOI via Crossref search
         try:
@@ -290,24 +312,66 @@ async def enrich_arxiv_paper(
 
             for work in crossref_results:
                 if work.doi:
+                    # Validate: if we have author info, check for overlap with Crossref result
+                    if authors and work.authors:
+                        existing_author_last = authors[0].split()[-1].lower()
+                        matched = any(
+                            a.split()[-1].lower() == existing_author_last
+                            for a in work.authors
+                        )
+                        if not matched:
+                            continue  # Skip this result, keep looking
                     result["external_ids"]["doi"] = work.doi
                     break
         except Exception:
             pass
 
-    # Now enrich with DOI if we have one
-    doi = result.get("external_ids", {}).get("doi", "")
-    if doi:
+    # Enrich via OpenAlex using arXiv DOI first (guaranteed to resolve)
+    arxiv_id = result.get("external_ids", {}).get("arxiv", paper_id or "").replace("arXiv:", "")
+    # Strip version suffix (e.g. "1706.03762v7" -> "1706.03762")
+    arxiv_id = re.sub(r"v\d+$", "", arxiv_id)
+    if arxiv_id:
+        arxiv_doi = f"10.48550/arXiv.{arxiv_id}"
         try:
-            enriched = await enrich_paper_by_doi(
-                doi=doi,
+            result = await enrich_paper_by_doi(
+                doi=arxiv_doi,
                 existing_paper=result,
                 crossref_mailto=crossref_mailto,
                 openalex_api_key=openalex_api_key,
                 timeout=timeout,
                 proxy=proxy,
             )
-            result = enriched
+        except Exception:
+            pass
+
+    # If still no concepts/refs, fall back to Crossref DOI or title search
+    if not result.get("concepts") and not result.get("referenced_works"):
+        doi = result.get("external_ids", {}).get("doi", "")
+        if doi:
+            try:
+                result = await enrich_paper_by_doi(
+                    doi=doi,
+                    existing_paper=result,
+                    crossref_mailto=crossref_mailto,
+                    openalex_api_key=openalex_api_key,
+                    timeout=timeout,
+                    proxy=proxy,
+                )
+            except Exception:
+                pass
+
+    if not result.get("concepts") and not result.get("referenced_works"):
+        try:
+            result = await enrich_paper_by_title(
+                title=title,
+                existing_paper=result,
+                year=year,
+                authors=authors,
+                crossref_mailto=crossref_mailto,
+                openalex_api_key=openalex_api_key,
+                timeout=timeout,
+                proxy=proxy,
+            )
         except Exception:
             pass
 
