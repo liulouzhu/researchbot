@@ -10,9 +10,103 @@ from typing import Any
 
 from loguru import logger
 
+from researchbot.agent.tools.base import Tool
+from researchbot.agent.tools.openalex_client import search_openalex_concepts
+from researchbot.knowledge_graph import KnowledgeGraph, _safe_id
+from researchbot.search_index import SearchIndex
+from researchbot.config.schema import SemanticSearchConfig
+
 
 TRACKS_FILE = Path.home() / ".researchbot" / "concept_tracks.json"
 EXPLORATION_FILE = Path.home() / ".researchbot" / "exploration_context.json"
+
+
+def _format_paper_list(papers: list[dict[str, Any]], start: int = 1) -> list[str]:
+    """Format a list of papers into output lines."""
+    lines = []
+    for i, p in enumerate(papers, start):
+        title = p.get("title", "?")
+        year = p.get("year", "?")
+        cited = p.get("citation_count") or p.get("cited_by_count", 0)
+        lines.append(f"  [{i}] {title} ({year}) — cited by {cited}")
+    return lines
+
+
+def _get_kg_and_index(workspace: str | None, semantic_config: SemanticSearchConfig | None):
+    """Helper to get KnowledgeGraph and SearchIndex instances."""
+    if not workspace or not semantic_config:
+        return None, None
+    db_path = Path(workspace) / semantic_config.sqlite_db_path
+    if not db_path.parent.exists():
+        return None, None
+    index = SearchIndex(db_path, semantic_config)
+    index._ensure_graph_initialized()
+    kg = index.get_graph()
+    return kg, index
+
+
+async def _map_topic_to_concepts(
+    topic: str,
+    kg: KnowledgeGraph | None,
+    openalex_api_key: str | None,
+    proxy: str | None,
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    """Map a topic string to concept entries (local + OpenAlex)."""
+    candidates: dict[str, dict[str, Any]] = {}
+
+    # 1. Search local concepts table
+    if kg:
+        conn = kg._conn()
+        pattern = f"%{topic}%"
+        rows = conn.execute(
+            "SELECT concept_id, display_name, level, wikipedia_url FROM concepts WHERE display_name LIKE ? LIMIT ?",
+            (pattern, top_k * 2),
+        ).fetchall()
+        for r in rows:
+            cid = r["concept_id"]
+            candidates[cid] = {
+                "id": cid,
+                "display_name": r["display_name"],
+                "level": r["level"],
+                "wikipedia_url": r["wikipedia_url"] or "",
+                "source": "local",
+                "paper_count": 0,
+            }
+        # Get paper counts
+        for cid in candidates:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM paper_concepts WHERE concept_id = ?",
+                (cid,),
+            ).fetchone()
+            candidates[cid]["paper_count"] = row["cnt"] if row else 0
+
+    # 2. Supplement from OpenAlex if local results < 3
+    if len(candidates) < 3:
+        try:
+            oa_results = await search_openalex_concepts(
+                query=topic,
+                api_key=openalex_api_key,
+                proxy=proxy,
+                top_k=top_k,
+            )
+            for oa in oa_results:
+                cid = _safe_id(oa["display_name"])
+                if cid not in candidates:
+                    candidates[cid] = {
+                        "id": cid,
+                        "display_name": oa["display_name"],
+                        "level": oa["level"],
+                        "wikipedia_url": oa["wikipedia_url"] or "",
+                        "source": "openalex",
+                        "paper_count": oa["paper_count"],
+                    }
+        except Exception:
+            pass
+
+    # Sort by paper_count desc, take top_k
+    sorted_concepts = sorted(candidates.values(), key=lambda x: x["paper_count"], reverse=True)
+    return sorted_concepts[:top_k]
 
 
 class ConceptTrackStore:
@@ -146,3 +240,338 @@ class ExplorationContext:
             return ctx
         except (json.JSONDecodeError, IOError):
             return ctx
+
+
+class ConceptExploreTool(Tool):
+    """Explore concepts in the knowledge graph.
+
+    Supports three modes:
+    - explore_topic: input a topic, map to concepts, explore concept network
+    - explore_paper: explore concept network starting from a paper
+    - track_concepts: subscribe to concept updates
+    """
+
+    name = "concept_explore"
+    description = (
+        "Explore concepts in the knowledge graph. Use explore_topic to discover "
+        "concepts from a keyword, explore_paper to drill into a paper's concepts, "
+        "or track_concepts to subscribe to updates for specific concepts."
+    )
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["explore_topic", "explore_paper", "track_concepts", "list_tracks", "remove_track"],
+                "description": "The exploration action to perform",
+            },
+            "topic": {
+                "type": "string",
+                "description": "Topic keyword for explore_topic",
+            },
+            "paper_id": {
+                "type": "string",
+                "description": "Paper ID for explore_paper",
+            },
+            "concept_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Concept IDs to track (for track_concepts)",
+            },
+            "depth": {
+                "type": "integer",
+                "description": "Exploration depth (default 2)",
+                "default": 2,
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Number of papers/concepts to return per step (default 10)",
+                "default": 10,
+            },
+        },
+        "required": ["action"],
+    }
+
+    def __init__(
+        self,
+        workspace: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
+        openalex_api_key: str | None = None,
+        proxy: str | None = None,
+    ):
+        self._workspace = workspace
+        self._semantic_config = semantic_config
+        self._openalex_api_key = openalex_api_key
+        self._proxy = proxy
+        self._track_store = ConceptTrackStore()
+        self._ctx = ExplorationContext.load()
+
+    def _resolve_path(self, path: str) -> Path:
+        p = Path(path)
+        if not p.is_absolute() and self._workspace:
+            p = Path(self._workspace) / p
+        return p
+
+    async def execute(
+        self,
+        action: str,
+        topic: str | None = None,
+        paper_id: str | None = None,
+        concept_ids: list[str] | None = None,
+        depth: int = 2,
+        top_k: int = 10,
+        **kwargs: Any,
+    ) -> str:
+        if action == "explore_topic":
+            return await self._explore_topic(topic or "", depth, top_k)
+        elif action == "explore_paper":
+            return await self._explore_paper(paper_id or "", depth, top_k)
+        elif action == "track_concepts":
+            return await self._track_concepts(concept_ids or [])
+        elif action == "list_tracks":
+            return await self._list_tracks()
+        elif action == "remove_track":
+            return await self._remove_track(paper_id or "")
+        else:
+            return f"Unknown action: {action}"
+
+    async def _explore_topic(self, topic: str, depth: int, top_k: int) -> str:
+        """Map topic to concepts and start interactive exploration."""
+        kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
+        if kg is None:
+            return "Error: Knowledge graph not available. Please configure semantic_search in config."
+
+        # Map topic to concepts
+        concepts = await _map_topic_to_concepts(
+            topic, kg, self._openalex_api_key, self._proxy, top_k=5
+        )
+
+        if not concepts:
+            return f"No concepts found for topic: {topic}\n\nTry a different keyword or enrich some papers first."
+
+        # Show concept selection
+        local = [c for c in concepts if c["source"] == "local"]
+        oa = [c for c in concepts if c["source"] == "openalex"]
+
+        lines = [f"探索主题: \"{topic}\"\n"]
+        if local:
+            lines.append(f"在本地图谱中找到 {len(local)} 个匹配的概念：")
+            for i, c in enumerate(local, 1):
+                lines.append(f"  [{i}] {c['display_name']} ({c['id']}) — {c['paper_count']} 篇论文")
+        if oa:
+            lines.append(f"\n补充自 OpenAlex：")
+            for i, c in enumerate(oa, len(local) + 1):
+                lines.append(f"  [{i}] {c['display_name']} — {c['paper_count']} 篇论文")
+
+        lines.append("\n请选择概念编号，或直接输入 concept_id：")
+        lines.append("(输入 'quit' 退出探索，输入 'back' 返回)")
+
+        # Auto-select if only one concept
+        if len(concepts) == 1:
+            c = concepts[0]
+            return await self._start_concept_exploration(c["id"], c["display_name"], depth, top_k)
+
+        return "\n".join(lines)
+
+    async def _start_concept_exploration(self, concept_id: str, concept_name: str, depth: int, top_k: int) -> str:
+        """Begin exploration at a specific concept."""
+        kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
+        if kg is None:
+            return "Error: Knowledge graph not available."
+
+        # Get neighbors
+        neighbors = kg.get_concept_neighbors(concept_id, top_k=top_k)
+        neighbor_details = []
+        for nid, cnt in neighbors:
+            conn = kg._conn()
+            row = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (nid,)).fetchone()
+            name = row["display_name"] if row else nid
+            neighbor_details.append({"id": nid, "name": name, "co_count": cnt})
+
+        # Get representative papers
+        paper_scores = kg.get_papers_by_concept(concept_id, top_k=top_k)
+        papers = []
+        for pid, score in paper_scores:
+            if index:
+                p = index.get_paper(pid)
+                if p:
+                    papers.append(p)
+            if not papers:
+                conn = kg._conn()
+                row = conn.execute("SELECT title, year, citation_count FROM papers WHERE paper_id = ?", (pid,)).fetchone()
+                if row:
+                    papers.append({
+                        "paper_id": pid,
+                        "title": row["title"],
+                        "year": row["year"],
+                        "citation_count": row["citation_count"],
+                    })
+
+        # Save context
+        self._ctx.push(concept_id, concept_name, neighbor_details, papers)
+
+        lines = [
+            f"概念: {concept_name}",
+            f"═══════════════════════════════════",
+            f"邻居概念（共 {len(neighbor_details)} 个）：",
+        ]
+        for i, n in enumerate(neighbor_details, 1):
+            lines.append(f"  [{i}] {n['name']} ({n['id']}) — {n['co_count']}次共现")
+
+        lines.append(f"\n代表性论文（共 {len(papers)} 篇）：")
+        lines.extend(_format_paper_list(papers[:top_k]))
+
+        lines.append("\n选择操作：")
+        lines.append("  [1-{}] 沿邻居概念继续深入".format(len(neighbor_details) if neighbor_details else 0))
+        lines.append("  [p] 查看代表性论文详情")
+        lines.append("  [back] 返回上一层")
+        lines.append("  [quit] 退出探索")
+
+        return "\n".join(lines)
+
+    async def _explore_paper(self, paper_id: str, depth: int, top_k: int) -> str:
+        """Explore concept network starting from a paper."""
+        kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
+        if kg is None:
+            return "Error: Knowledge graph not available."
+
+        if not paper_id:
+            return "Error: paper_id is required for explore_paper."
+
+        # Get paper metadata
+        paper = None
+        if index:
+            paper = index.get_paper(paper_id)
+        if not paper:
+            conn = kg._conn()
+            row = conn.execute(
+                "SELECT title, year, authors_json FROM papers WHERE paper_id = ?", (paper_id,)
+            ).fetchone()
+            if row:
+                import json as _json
+                authors = []
+                try:
+                    authors = _json.loads(row["authors_json"]) if row["authors_json"] else []
+                except Exception:
+                    pass
+                paper = {
+                    "paper_id": paper_id,
+                    "title": row["title"],
+                    "year": row["year"],
+                    "authors": authors,
+                }
+
+        if not paper:
+            return f"Error: Paper '{paper_id}' not found. Check the paper ID and try again."
+
+        # Get concepts for this paper
+        concept_ids = kg.get_paper_concepts(paper_id)
+        if not concept_ids:
+            return f"Paper '{paper_id}' has no concept tags in the graph. Enrich it with paper_enrich first."
+
+        # Get concept details and their neighbors
+        concept_details = []
+        for cid in concept_ids:
+            conn = kg._conn()
+            row = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (cid,)).fetchone()
+            name = row["display_name"] if row else cid
+            paper_count = len(kg.get_papers_by_concept(cid, top_k=1000))
+            neighbors = kg.get_concept_neighbors(cid, top_k=5)
+            neighbor_details = []
+            for nid, cnt in neighbors:
+                nr = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (nid,)).fetchone()
+                neighbor_details.append({"id": nid, "name": nr["display_name"] if nr else nid, "co_count": cnt})
+            concept_details.append({
+                "id": cid,
+                "name": name,
+                "paper_count": paper_count,
+                "neighbors": neighbor_details,
+            })
+
+        # Find common citations across all concepts
+        if len(concept_ids) > 1:
+            common = kg.find_common_citations(concept_ids)
+            common_count = len(common)
+        else:
+            common_count = 0
+
+        # Build output
+        title = paper.get("title", "?")
+        year = paper.get("year", "?")
+        authors = paper.get("authors", [])
+        author_str = ", ".join(authors[:3]) + (" et al." if len(authors) > 3 else "") if authors else "Unknown"
+
+        lines = [
+            f"探索论文: {paper_id}",
+            f"═══════════════════════════════════",
+            f"标题: {title}",
+            f"年份: {year} | 作者: {author_str}",
+            f"\n概念标签（共 {len(concept_details)} 个）：",
+        ]
+        for cd in concept_details:
+            lines.append(f"  • {cd['name']} ({cd['id']}) — {cd['paper_count']} 篇论文")
+            if cd["neighbors"]:
+                neighbor_str = ", ".join(f"{n['name']}({n['co_count']})" for n in cd["neighbors"][:3])
+                lines.append(f"    邻居: {neighbor_str}")
+
+        if common_count > 0:
+            lines.append(f"\n共同论文（{len(concept_ids)} 个概念交集）: {common_count} 篇")
+
+        lines.append("\n选择操作：")
+        for i, cd in enumerate(concept_details, 1):
+            lines.append(f"  [{i}] 沿 {cd['name']} → {cd['paper_count']} 篇深入")
+        lines.append("  [c] 查看共同论文")
+        lines.append("  [quit] 退出探索")
+
+        # Save initial state for paper exploration
+        self._ctx.push(concept_details[0]["id"], concept_details[0]["name"], concept_details[0]["neighbors"], [])
+
+        return "\n".join(lines)
+
+    async def _track_concepts(self, concept_ids: list[str]) -> str:
+        """Add or update concept track subscriptions."""
+        if not concept_ids:
+            return "Error: concept_ids required for track_concepts."
+
+        kg, _ = _get_kg_and_index(self._workspace, self._semantic_config)
+        if kg is None:
+            return "Error: Knowledge graph not available."
+
+        added = []
+        for cid in concept_ids:
+            conn = kg._conn()
+            row = conn.execute("SELECT display_name FROM concepts WHERE concept_id = ?", (cid,)).fetchone()
+            name = row["display_name"] if row else cid
+            self._track_store.add_or_update(cid, name)
+            added.append(f"  • {name} ({cid})")
+
+        return "已添加/更新跟踪的概念：\n" + "\n".join(added)
+
+    async def _list_tracks(self) -> str:
+        """List all tracked concepts."""
+        tracks = self._track_store.get_all()
+        if not tracks:
+            return "暂无跟踪的概念。使用 track_concepts 添加。"
+
+        lines = [f"跟踪的概念（共 {len(tracks)} 个）：\n"]
+        for i, t in enumerate(tracks, 1):
+            name = t.get("name", t["id"])
+            added = t.get("added_at", "")[:10] if t.get("added_at") else "?"
+            last_checked = t.get("last_checked_at", "")[:10] if t.get("last_checked_at") else "?"
+            new_count = t.get("last_new_count", 0)
+            lines.append(f"  [{i}] {name}")
+            lines.append(f"      ID: {t['id']}")
+            lines.append(f"      添加于: {added} | 上次检查: {last_checked} | 新增: {new_count} 篇")
+
+        lines.append("\n使用 remove_track <concept_id> 移除跟踪。")
+        return "\n".join(lines)
+
+    async def _remove_track(self, concept_id: str) -> str:
+        """Remove a concept from tracking."""
+        if not concept_id:
+            return "Error: concept_id required."
+        removed = self._track_store.remove(concept_id)
+        if removed:
+            return f"已移除跟踪: {concept_id}"
+        return f"未找到跟踪: {concept_id}"
