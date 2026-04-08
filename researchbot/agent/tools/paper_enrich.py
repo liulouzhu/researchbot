@@ -45,17 +45,17 @@ def _make_safe_paper_id(paper: dict[str, Any]) -> str:
         return existing_id
 
     # Priority 2: arXiv ID
-    arxiv_id = paper.get("external_ids", {}).get("arxiv", "")
+    arxiv_id = (paper.get("external_ids") or {}).get("arxiv", "")
     if arxiv_id and arxiv_id == safe_filename(arxiv_id):
         return arxiv_id
 
     # Priority 3: OpenAlex ID
-    openalex_id = paper.get("external_ids", {}).get("openalex", "")
+    openalex_id = (paper.get("external_ids") or {}).get("openalex", "")
     if openalex_id and openalex_id == safe_filename(openalex_id):
         return openalex_id
 
     # Priority 4: DOI (safe version)
-    doi = paper.get("external_ids", {}).get("doi", "")
+    doi = (paper.get("external_ids") or {}).get("doi", "")
     if doi:
         safe_doi = _safe_filename(doi)
         if safe_doi:
@@ -92,8 +92,8 @@ def _safe_filename(s: str) -> str:
 
 def _paper_to_enriched_dict(paper: dict[str, Any]) -> dict[str, Any]:
     """Convert paper (possibly from arXiv) to standardized enriched dict."""
-    # Check if it's already in normalized format
-    if "external_ids" in paper:
+    # Check if it's already in normalized format (external_ids must be a non-empty dict)
+    if paper.get("external_ids"):
         return paper
 
     # Convert from arXiv-style paper_save format
@@ -141,6 +141,7 @@ async def enrich_paper_by_doi(
     errors: list[str] = []
 
     # Try Crossref first
+    crossref_paper = None
     try:
         crossref_work = await get_crossref_work(
             doi=doi,
@@ -151,11 +152,10 @@ async def enrich_paper_by_doi(
         if crossref_work:
             crossref_paper = normalize_from_crossref(crossref_work)
             result = merge_papers(result, crossref_paper)
-            return result
     except Exception as e:
         errors.append(f"Crossref: {e}")
 
-    # Try OpenAlex
+    # Also try OpenAlex (it has concepts/citations that Crossref lacks)
     try:
         openalex_work = await get_openalex_work(
             identifier=doi,
@@ -166,7 +166,6 @@ async def enrich_paper_by_doi(
         if openalex_work:
             openalex_paper = normalize_from_openalex(openalex_work)
             result = merge_papers(result, openalex_paper)
-            return result
     except Exception as e:
         errors.append(f"OpenAlex: {e}")
 
@@ -267,7 +266,7 @@ async def enrich_arxiv_paper(
         result["source"] = "arxiv"
 
     # Check if we already have a DOI
-    doi = result.get("external_ids", {}).get("doi", "")
+    doi = (result.get("external_ids") or {}).get("doi", "")
     title = result.get("title", "")
     authors = result.get("authors", [])
     year = result.get("year", "")
@@ -327,7 +326,7 @@ async def enrich_arxiv_paper(
             pass
 
     # Enrich via OpenAlex using arXiv DOI first (guaranteed to resolve)
-    arxiv_id = result.get("external_ids", {}).get("arxiv", paper_id or "").replace("arXiv:", "")
+    arxiv_id = (result.get("external_ids") or {}).get("arxiv", paper_id or "").replace("arXiv:", "")
     # Strip version suffix (e.g. "1706.03762v7" -> "1706.03762")
     arxiv_id = re.sub(r"v\d+$", "", arxiv_id)
     if arxiv_id:
@@ -346,7 +345,7 @@ async def enrich_arxiv_paper(
 
     # If still no concepts/refs, fall back to Crossref DOI or title search
     if not result.get("concepts") and not result.get("referenced_works"):
-        doi = result.get("external_ids", {}).get("doi", "")
+        doi = (result.get("external_ids") or {}).get("doi", "")
         if doi:
             try:
                 result = await enrich_paper_by_doi(
@@ -570,7 +569,7 @@ class PaperEnrichTool(Tool):
                 timeout=DEFAULT_TIMEOUT,
                 proxy=self._proxy,
             )
-        elif paper_id and existing and existing.get("external_ids", {}).get("arxiv"):
+        elif paper_id and existing and (existing.get("external_ids") or {}).get("arxiv"):
             result = await enrich_arxiv_paper(
                 paper_id=paper_id,
                 existing_paper=existing,
@@ -579,11 +578,12 @@ class PaperEnrichTool(Tool):
                 timeout=DEFAULT_TIMEOUT,
                 proxy=self._proxy,
             )
-        elif title:
+        elif title or (existing and existing.get("title")):
+            enrich_title = title or (existing.get("title") if existing else None)
             result = await enrich_paper_by_title(
-                title=title,
+                title=enrich_title,
                 existing_paper=existing,
-                year=existing.get("year") if existing else None,
+                year=str(existing.get("year")) if existing and existing.get("year") else None,
                 authors=existing.get("authors") if existing else None,
                 crossref_mailto=self.crossref_mailto,
                 openalex_api_key=self.openalex_api_key,
