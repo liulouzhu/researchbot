@@ -144,7 +144,9 @@ class SearchIndex:
                 openalex_id TEXT NOT NULL DEFAULT '',
                 crossref_id TEXT NOT NULL DEFAULT '',
                 content_hash TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                graph_sync_status TEXT NOT NULL DEFAULT 'ok',
+                graph_sync_error TEXT NOT NULL DEFAULT ''
             )
         """)
 
@@ -362,8 +364,9 @@ class SearchIndex:
             INSERT INTO papers (
                 paper_id, source, title, authors_json, year, venue, publication_type,
                 url, pdf_url, abstract, summary_json, topic, tags_json, categories_json,
-                doi, openalex_id, crossref_id, content_hash, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                doi, openalex_id, crossref_id, content_hash, updated_at,
+                graph_sync_status, graph_sync_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(paper_id) DO UPDATE SET
                 source=excluded.source,
                 title=excluded.title,
@@ -382,7 +385,9 @@ class SearchIndex:
                 openalex_id=excluded.openalex_id,
                 crossref_id=excluded.crossref_id,
                 content_hash=excluded.content_hash,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                graph_sync_status=excluded.graph_sync_status,
+                graph_sync_error=excluded.graph_sync_error
             """,
             (
                 paper_id,
@@ -404,6 +409,8 @@ class SearchIndex:
                 crossref_id,
                 content_hash,
                 now,
+                "ok",       # graph_sync_status
+                "",         # graph_sync_error
             ),
         )
 
@@ -436,6 +443,11 @@ class SearchIndex:
             kg.upsert_paper(paper, commit=False)
         except Exception as e:
             logger.warning(f"Failed to sync paper {paper_id} to knowledge graph: {e}")
+            # Record failure in papers table so it is observable
+            conn.execute(
+                "UPDATE papers SET graph_sync_status = 'failed', graph_sync_error = ? WHERE paper_id = ?",
+                (str(e)[:500], paper_id),
+            )
 
         conn.commit()
 
@@ -930,3 +942,29 @@ Only output the JSON array, nothing else."""
         conn = self._get_conn()
         row = conn.execute("SELECT COUNT(*) as cnt FROM papers").fetchone()
         return row["cnt"] if row else 0
+
+    def get_paper_graph_sync_status(self, paper_id: str) -> dict[str, Any]:
+        """Return graph sync status for a paper: {status: 'ok'|'failed'|'', error: str}."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT graph_sync_status, graph_sync_error FROM papers WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchone()
+        if not row:
+            return {"status": "", "error": "paper not found"}
+        return {"status": row["graph_sync_status"], "error": row["graph_sync_error"]}
+
+    def list_graph_sync_failures(self, limit: int = 100) -> list[dict[str, Any]]:
+        """List papers whose graph sync failed, ordered by most recent first."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """
+            SELECT paper_id, graph_sync_status, graph_sync_error, updated_at
+            FROM papers
+            WHERE graph_sync_status = 'failed'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
