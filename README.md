@@ -24,7 +24,6 @@
 ### 3. 多渠道接入
 - **命令行界面**: 直接在终端与助手交互
 - **Telegram Bot**: 通过 Telegram 与助手对话
-- **微信**: 支持企业微信机器人
 
 ### 4. 定时任务
 - 支持 Cron 定时任务
@@ -140,6 +139,33 @@ researchbot paper index --rebuild
 ```
 
 论文会在保存时自动索引。
+
+### 知识图谱
+
+本地论文库除了全文检索，还会同步维护知识图谱，用来记录：
+- 引用关系
+- 概念关系
+- 作者协作关系
+- 相关工作关系
+
+图谱会在你保存论文或增强论文元数据时自动更新。常见入口有：
+- `paper_save`
+- `paper_enrich`
+- `paper_search_local` 的引用扩展
+
+如果本地论文文件已经很多，或者你怀疑图谱关系过时，可以手动重建：
+
+```bash
+researchbot rebuild-graph
+researchbot rebuild-graph --workspace /path/to/workspace
+```
+
+在对话中也可以直接说：
+- `重建知识图谱`
+- `重建图谱`
+- `rebuild the graph`
+
+系统会调用 `knowledge_graph_rebuild` 工具完成重建。
 
 ### 使用
 
@@ -313,7 +339,7 @@ researchbot/
 
 ## 配置文件路径
 
-- 新版配置: `~/.researchbot/config.json`
+- 配置: `~/.researchbot/config.json`
 
 
 ## 致谢

@@ -1101,3 +1101,74 @@ Only output the JSON array, nothing else."""
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Shared graph-rebuild helper (used by both CLI and agent tools)
+# ---------------------------------------------------------------------------
+
+_EMPTY_KG_STATS: dict[str, int] = {
+    "concepts": 0,
+    "authors": 0,
+    "citation_edges": 0,
+    "paper_concept_edges": 0,
+    "author_collaborations": 0,
+    "paper_related_edges": 0,
+}
+
+
+async def rebuild_graph_from_workspace(
+    workspace: Path,
+    semantic_config: SemanticSearchConfig,
+) -> dict[str, Any]:
+    """Rebuild the knowledge graph from all papers in a workspace.
+
+    Args:
+        workspace: Path to the workspace directory.
+        semantic_config: Semantic search configuration.
+
+    Returns:
+        A dict with keys: papers_dir_found (bool), total (int),
+        count (int), stats (dict).
+    """
+    import json as _json
+
+    literature_dir = workspace / "literature"
+    papers_dir = literature_dir / "papers"
+
+    result: dict[str, Any] = {
+        "papers_dir_found": papers_dir.exists(),
+        "total": 0,
+        "count": 0,
+        "stats": {},
+    }
+
+    if not result["papers_dir_found"]:
+        return result
+
+    # Load all papers
+    papers: list[dict[str, Any]] = []
+    for json_file in papers_dir.glob("*.json"):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                papers.append(_json.load(f))
+        except Exception:
+            pass
+
+    result["total"] = len(papers)
+
+    if not papers:
+        result["stats"] = _EMPTY_KG_STATS.copy()
+        return result
+
+    # Initialize search index and graph
+    db_path = workspace / semantic_config.sqlite_db_path
+    search_index = SearchIndex(db_path, semantic_config)
+    await search_index.initialize()
+    kg = search_index.get_graph()
+
+    result["count"] = kg.rebuild_from_papers(papers)
+    result["stats"] = kg.stats()
+    search_index.close()
+
+    return result

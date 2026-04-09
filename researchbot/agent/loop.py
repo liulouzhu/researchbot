@@ -147,6 +147,10 @@ class _LoopHookChain(AgentHook):
         return self._extras.finalize_content(context, content)
 
 
+# Pre-compiled regex for extracting workspace Path from exec commands
+_RE_WS_FROM_PATH_CALL = re.compile(r"workspace\s*=\s*Path\(['\"]([^'\"]+)['\"]\)")
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -280,6 +284,7 @@ class AgentLoop:
             PaperSearchLocalTool,
             PaperIndexTool,
             GraphQueryTool,
+            KnowledgeGraphRebuildTool,
         )
         from researchbot.agent.tools.paper_cite import PaperCiteTool
         from researchbot.agent.tools.innovation import InnovationWorkflowTool
@@ -329,6 +334,10 @@ class AgentLoop:
             semantic_config=semantic_config,
         ))
         self.tools.register(GraphQueryTool(
+            workspace=str(self.workspace),
+            semantic_config=semantic_config,
+        ))
+        self.tools.register(KnowledgeGraphRebuildTool(
             workspace=str(self.workspace),
             semantic_config=semantic_config,
         ))
@@ -557,6 +566,50 @@ class AgentLoop:
                 function_provider_specific_fields=tc.function_provider_specific_fields,
             ))
             logger.info("Rerouted exec innovation call to innovation_workflow with params: {}", parsed)
+
+        # ------------------------------------------------------------
+        # Knowledge graph rebuild rewrite
+        # If the user is asking to rebuild the graph and the LLM generated
+        # an exec call instead of the knowledge_graph_rebuild tool,
+        # rewrite it to use the correct tool.
+        # ------------------------------------------------------------
+        kg_rebuild_keywords = [
+            "重建图谱", "重建知识图谱", "rebuild graph", "rebuild the graph",
+            "知识图谱重建", "kg rebuild", "knowledge graph rebuild",
+        ]
+        latest_user_text_lower = latest_user_text.lower()
+        user_asked_kg_rebuild = any(kw in latest_user_text_lower for kw in kg_rebuild_keywords)
+
+        has_direct_kg_call = any(tc.name == "knowledge_graph_rebuild" for tc in tool_calls)
+
+        if user_asked_kg_rebuild and not has_direct_kg_call:
+            for tc in tool_calls:
+                if tc.name != "exec":
+                    continue
+                args = tc.arguments if isinstance(tc.arguments, dict) else {}
+                command = str(args.get("command", "")).lower()
+                kg_indicators = [
+                    "知识图谱", "knowledge graph", "kg.", "kg_build",
+                    "rebuild_from_papers", "literature/papers",
+                    "重建图谱", "重建知识", "rebuild kg",
+                ]
+                if any(ind in command for ind in kg_indicators):
+                    # Rewrite to knowledge_graph_rebuild tool
+                    kg_args: dict[str, Any] = {}
+                    # Try to extract workspace from the exec command
+                    ws_match = _RE_WS_FROM_PATH_CALL.search(command)
+                    if ws_match:
+                        kg_args["workspace"] = ws_match.group(1)
+                    rewritten.append(ToolCallRequest(
+                        id=tc.id,
+                        name="knowledge_graph_rebuild",
+                        arguments=kg_args,
+                        extra_content=tc.extra_content,
+                        provider_specific_fields=tc.provider_specific_fields,
+                        function_provider_specific_fields=tc.function_provider_specific_fields,
+                    ))
+                    logger.info("Rerouted exec knowledge-graph-rebuild call to knowledge_graph_rebuild tool")
+                    continue
 
         return rewritten
 

@@ -721,3 +721,108 @@ class GraphQueryTool(Tool):
 
         except Exception as e:
             return f"Graph query error: {e}"
+
+
+class KnowledgeGraphRebuildTool(Tool):
+    """Rebuild the knowledge graph from all local papers.
+
+    Scans literature/papers/, extracts graph relationships
+    (citations, concepts, authors, related_works), and rebuilds the graph.
+    Use this after importing many papers or when graph statistics seem stale.
+    """
+
+    name = "knowledge_graph_rebuild"
+    description = (
+        "Rebuild (重建) the entire knowledge graph from all papers in local storage. "
+        "This reconstructs citation edges, concept nodes, author nodes, and related-work edges "
+        "from the papers stored in literature/papers/. "
+        "If the user says '重建图谱', '重建知识图谱', 'rebuild the graph', or 'rebuild knowledge graph', "
+        "call this tool directly and do not use exec or shell commands first. "
+        "Use this after bulk-importing papers or when graph queries return stale/missing data."
+    )
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "workspace": {
+                "type": "string",
+                "description": "Workspace directory path (optional). Uses configured workspace if not provided.",
+            },
+            "config": {
+                "type": "string",
+                "description": "Path to config file (optional). Uses default config if not provided.",
+            },
+        },
+        "required": [],
+    }
+
+    def __init__(
+        self,
+        workspace: str | None = None,
+        semantic_config: SemanticSearchConfig | None = None,
+    ):
+        self._workspace = Path(workspace) if workspace else None
+        self._semantic_config = semantic_config or SemanticSearchConfig()
+
+    async def execute(
+        self,
+        workspace: str | None = None,
+        config: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        """Rebuild the knowledge graph."""
+        from researchbot.config.loader import load_config, set_config_path
+        from researchbot.search_index import rebuild_graph_from_workspace
+
+        # Resolve workspace
+        ws: Path | None
+        if workspace:
+            ws = Path(workspace) if Path(workspace).is_absolute() else (self._workspace / workspace if self._workspace else Path(workspace))
+        elif self._workspace:
+            ws = self._workspace
+        else:
+            return "Error: workspace not configured and no workspace provided"
+
+        # Load config if provided
+        semantic_config = self._semantic_config
+        if config:
+            config_path = Path(config).expanduser().resolve()
+            if not config_path.exists():
+                return f"Error: config file not found: {config_path}"
+            set_config_path(config_path)
+            loaded_config = load_config(config_path)
+            semantic_config = getattr(loaded_config.literature, "semantic_search", None) or semantic_config
+
+        papers_dir = ws / "literature" / "papers"
+        if not papers_dir.exists():
+            return (
+                f"Papers directory not found: {papers_dir}\n"
+                "Nothing to rebuild. Make sure papers are saved first "
+                "(e.g., use paper_save or paper_enrich)."
+            )
+
+        result = await rebuild_graph_from_workspace(ws, semantic_config)
+
+        lines = [
+            f"Knowledge graph rebuild complete\n",
+            f"Papers directory: {papers_dir} [{'found' if result['papers_dir_found'] else 'NOT FOUND'}]\n",
+            f"Total papers found: {result['total']}\n",
+            f"Papers processed: {result['count']}\n",
+            "-" * 50,
+        ]
+
+        stats = result.get("stats") or {}
+        if stats:
+            lines.extend([
+                "Graph statistics:",
+                f"  Concepts:             {stats.get('concepts', 0):>6}",
+                f"  Authors:              {stats.get('authors', 0):>6}",
+                f"  Citation edges:       {stats.get('citation_edges', 0):>6}",
+                f"  Paper-concept edges:  {stats.get('paper_concept_edges', 0):>6}",
+                f"  Author collaborations:{stats.get('author_collaborations', 0):>6}",
+                f"  Paper related edges:  {stats.get('paper_related_edges', 0):>6}",
+            ])
+        else:
+            lines.append("(no graph stats available)")
+
+        return "\n".join(lines)

@@ -1264,38 +1264,22 @@ def rebuild_graph(
         console.print("Nothing to rebuild.")
         return
 
-    # Initialize search index (which also initializes graph tables)
-    import json
     import asyncio
-    from researchbot.knowledge_graph import KnowledgeGraph
-    from researchbot.search_index import SearchIndex
-
-    db_path = ws / config.literature.semantic_search.sqlite_db_path
-    search_index = SearchIndex(db_path, config.literature.semantic_search)
+    from researchbot.search_index import rebuild_graph_from_workspace
 
     console.print("[cyan]Initializing graph tables...[/cyan]")
-    search_index._get_conn()  # ensure dir exists
-    asyncio.run(search_index.initialize())
-    kg = search_index.get_graph()
+    result = asyncio.run(rebuild_graph_from_workspace(ws, config.literature.semantic_search))
 
-    # Load all papers
-    console.print("[cyan]Scanning papers...[/cyan]")
-    papers: list[dict] = []
-    for json_file in papers_dir.glob("*.json"):
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                paper = json.load(f)
-                papers.append(paper)
-        except Exception:
-            pass
+    if not result["papers_dir_found"]:
+        console.print(f"[yellow]No papers directory found at {papers_dir}[/yellow]")
+        console.print("Nothing to rebuild.")
+        return
 
-    total = len(papers)
+    total = result["total"]
+    count = result["count"]
+    stats = result["stats"]
+
     console.print(f"[cyan]Found {total} papers, building graph...[/cyan]")
-
-    count = kg.rebuild_from_papers(papers)
-    stats = kg.stats()
-    search_index.close()
-
     console.print(f"[green]✓[/green] Graph rebuilt from {count} papers")
     console.print(f"  Concepts: {stats['concepts']}")
     console.print(f"  Authors: {stats['authors']}")
