@@ -388,7 +388,8 @@ class PaperIndexTool(Tool):
             for paper in papers:
                 pid = paper.get("paper_id", "")
                 if pid:
-                    if await index.upsert_paper(paper):
+                    result = await index.upsert_paper(paper)
+                    if result["content_changed"]:
                         updated += 1
             index.close()
             return f"Index rebuilt: {updated}/{len(papers)} papers updated"
@@ -397,9 +398,9 @@ class PaperIndexTool(Tool):
             paper = self._load_paper(paper_id)
             if not paper:
                 return f"Paper not found: {paper_id}"
-            updated = await index.upsert_paper(paper)
+            result = await index.upsert_paper(paper)
             index.close()
-            if updated:
+            if result["content_changed"]:
                 return f"Indexed paper: {paper_id}"
             else:
                 return f"Paper unchanged (skipped): {paper_id}"

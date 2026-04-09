@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ from researchbot.knowledge_graph import KnowledgeGraph
 from researchbot.search_index import SearchIndex
 from researchbot.utils.helpers import safe_filename
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30.0
 
@@ -598,6 +600,7 @@ class PaperEnrichTool(Tool):
 
         # Save if requested
         saved_path = ""
+        index_status = "skipped (not configured)"
         if save and ws:
             # Ensure result has a paper_id for consistent display
             if not result.get("paper_id"):
@@ -609,10 +612,14 @@ class PaperEnrichTool(Tool):
             if search_index is not None:
                 try:
                     await search_index.initialize()
-                    await search_index.upsert_paper(result)
+                    sync_result = await search_index.upsert_paper(result)
                     search_index.close()
-                except Exception:
-                    pass  # Don't fail if index update fails
+                    index_status = f"{'ok' if sync_result['graph_sync_status'] == 'ok' else 'failed'}"
+                    if sync_result["graph_sync_status"] == "failed":
+                        index_status += f": {sync_result['graph_sync_error']}"
+                except Exception as e:
+                    index_status = f"failed: {e}"
+                    logger.warning(f"Search index update failed for {result.get('paper_id')}: {e}")
 
         # Format output
         lines = [
@@ -641,6 +648,7 @@ class PaperEnrichTool(Tool):
 
         if saved_path:
             lines.append(f"\nSaved to: {saved_path}")
+            lines.append(f"Search index sync: {index_status}")
 
         return "\n".join(lines)
 

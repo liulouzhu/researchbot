@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ from researchbot.agent.tools.arxiv_client import (
 )
 from researchbot.config.schema import SemanticSearchConfig
 from researchbot.search_index import SearchIndex
+
+logger = logging.getLogger(__name__)
 
 
 def _format_paper(entry: PaperEntry) -> str:
@@ -378,20 +381,27 @@ class PaperSaveTool(Tool):
         self._save_index(index_path, index)
 
         # Update search index
+        index_status = "skipped (not configured)"
         search_index = self._get_search_index()
         if search_index is not None:
             try:
                 await search_index.initialize()
-                await search_index.upsert_paper(paper_record)
+                sync_result = await search_index.upsert_paper(paper_record)
                 search_index.close()
-            except Exception:
-                pass  # Don't fail if index update fails
+                index_status = f"ok (content_changed={sync_result['content_changed']})"
+                if sync_result["graph_sync_status"] == "failed":
+                    index_status = f"graph sync failed: {sync_result['graph_sync_error']}"
+                    logger.warning(f"Graph sync failed for {paper_id}: {sync_result['graph_sync_error']}")
+            except Exception as e:
+                index_status = f"error: {e}"
+                logger.warning(f"Search index update failed for {paper_id}: {e}")
 
         return (
             f"Saved paper: {paper_id}\n"
             f"  JSON: {json_path}\n"
             f"  MD: {md_path}\n"
-            f"  Index updated: {index_path}"
+            f"  Index updated: {index_path}\n"
+            f"  Index sync: {index_status}"
         )
 
     def _generate_md(self, paper: dict[str, Any]) -> str:
@@ -721,6 +731,7 @@ class PaperSummarizeTool(Tool):
         paper_id: str,
         saved: str = "",
         text_source: str = "abstract",
+        index_status: str = "",
     ) -> str:
         """Format the summary result as a readable string."""
         source_label = {
@@ -758,6 +769,8 @@ class PaperSummarizeTool(Tool):
         if saved:
             lines.append("")
             lines.append(f"Saved to: {saved}")
+        if index_status:
+            lines.append(f"Index sync: {index_status}")
         return "\n".join(lines)
 
     async def _generate_summary(
@@ -934,15 +947,25 @@ class PaperSummarizeTool(Tool):
 
             # Update search index after saving summary
             search_index = self._get_search_index()
+            index_status = "skipped (not configured)"
             if search_index is not None:
                 try:
                     await search_index.initialize()
-                    await search_index.upsert_paper(resolved_paper)
+                    sync_result = await search_index.upsert_paper(resolved_paper)
                     search_index.close()
-                except Exception:
-                    pass  # Don't fail if index update fails
+                    index_status = f"ok (content_changed={sync_result['content_changed']})"
+                    if sync_result["graph_sync_status"] == "failed":
+                        index_status = f"graph sync failed: {sync_result['graph_sync_error']}"
+                        logger.warning(
+                            f"Graph sync failed for {resolved_paper_id}: {sync_result['graph_sync_error']}"
+                        )
+                except Exception as e:
+                    index_status = f"error: {e}"
+                    logger.warning(f"Search index update failed for {resolved_paper_id}: {e}")
 
-        return self._build_summary_result(summary, resolved_paper_id, saved_path, text_source)
+        return self._build_summary_result(
+            summary, resolved_paper_id, saved_path, text_source, index_status
+        )
 
 
 def _generate_pdf_url(paper_id: str) -> str:

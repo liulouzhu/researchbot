@@ -188,8 +188,26 @@ class KnowledgeGraph:
     def upsert_paper(self, paper: dict[str, Any], *, commit: bool = True) -> None:
         """Write all graph edges for a paper.
 
-        Calls upsert_citations, upsert_concepts, upsert_authors, and
-        upsert_related_works in a single transaction. Caller controls commit.
+        Field-by-field update semantics (per-field replace semantics):
+        - key absent from paper dict  → preserve existing edges (no-op for that field)
+        - key present as [] (empty)   → clear all existing edges for that field
+        - key present as [x, ...]     → replace existing edges with new list
+
+        This ensures partial paper objects (e.g. from paper_save, paper_enrich)
+        do not accidentally wipe edges that were loaded from a different source.
+
+        Storage model:
+        - citations:     unidirectional (citing → cited); traversal methods
+                         support both outbound and inbound queries
+        - concepts:      unidirectional (paper → concept)
+        - collaborations: unidirectional (author pair); paper contributions
+                          are tracked in author_collaboration_papers for
+                          correct, idempotent paper_count
+        - related_works: unidirectional in storage (paper → related);
+                         traversal is bidirectional via UNION queries
+
+        Each edge table uses a PRIMARY KEY that enforces uniqueness, so
+        duplicate inserts are impossible regardless of update semantics.
         """
         paper_id = paper.get("paper_id", "")
         if not paper_id:
@@ -198,25 +216,21 @@ class KnowledgeGraph:
         conn = self._conn()
         now = datetime.now(timezone.utc).isoformat()
 
-        # Citations (referenced_works)
-        refs = paper.get("referenced_works", [])
-        if refs:
-            self._upsert_citations(conn, paper_id, refs, now)
+        # Citations — only replace if referenced_works key is explicitly present
+        if "referenced_works" in paper:
+            self._upsert_citations(conn, paper_id, paper["referenced_works"], now)
 
-        # Concepts
-        concepts = paper.get("concepts", [])
-        if concepts:
-            self._upsert_concepts(conn, paper_id, concepts, now)
+        # Concepts — only replace if concepts key is explicitly present
+        if "concepts" in paper:
+            self._upsert_concepts(conn, paper_id, paper["concepts"], now)
 
-        # Authors + collaborations
-        authors = paper.get("authors", [])
-        if authors:
-            self._upsert_authors(conn, paper_id, authors, now)
+        # Authors + collaborations — only replace if authors key is explicitly present
+        if "authors" in paper:
+            self._upsert_authors(conn, paper_id, paper["authors"], now)
 
-        # Related works
-        related = paper.get("related_works", [])
-        if related:
-            self._upsert_related_works(conn, paper_id, related, now)
+        # Related works — only replace if related_works key is explicitly present
+        if "related_works" in paper:
+            self._upsert_related_works(conn, paper_id, paper["related_works"], now)
 
         if commit:
             conn.commit()
@@ -224,7 +238,12 @@ class KnowledgeGraph:
     def _upsert_citations(
         self, conn: sqlite3.Connection, paper_id: str, references: list[str], now: str
     ) -> None:
-        """Replace citation edges for paper_id (delete old, insert new)."""
+        """Replace citation edges for paper_id (delete old, insert new).
+
+        Always deletes existing edges for this paper first, then inserts.
+        Empty references list is valid — it clears all old citation edges.
+        Duplicate inserts are prevented by PRIMARY KEY (citing, cited).
+        """
         # Remove stale citation edges for this paper
         conn.execute(
             "DELETE FROM citation_edges WHERE citing_paper_id = ?",
@@ -368,7 +387,14 @@ class KnowledgeGraph:
     def _upsert_related_works(
         self, conn: sqlite3.Connection, paper_id: str, related: list[str], now: str
     ) -> None:
-        """Replace paper<->paper related edges for paper_id (delete old, insert new)."""
+        """Replace paper<->paper related edges for paper_id (delete old, insert new).
+
+        Always deletes existing edges for this paper first, then inserts.
+        Empty related_works list is valid — it clears all old related edges.
+        Storage is unidirectional (paper_id_1 → paper_id_2); traversal
+        in get_related_papers uses UNION to traverse bidirectionally.
+        Duplicate inserts are prevented by PRIMARY KEY (paper_id_1, paper_id_2).
+        """
         # Remove stale related-work edges for this paper
         conn.execute(
             "DELETE FROM paper_related WHERE paper_id_1 = ?",

@@ -140,6 +140,7 @@ class SearchIndex:
                 topic TEXT NOT NULL DEFAULT '',
                 tags_json TEXT NOT NULL DEFAULT '[]',
                 categories_json TEXT NOT NULL DEFAULT '[]',
+                keywords_json TEXT NOT NULL DEFAULT '[]',
                 doi TEXT NOT NULL DEFAULT '',
                 openalex_id TEXT NOT NULL DEFAULT '',
                 crossref_id TEXT NOT NULL DEFAULT '',
@@ -149,6 +150,12 @@ class SearchIndex:
                 graph_sync_error TEXT NOT NULL DEFAULT ''
             )
         """)
+
+        # Migration: add keywords_json if missing (existing DBs before this column)
+        try:
+            conn.execute("ALTER TABLE papers ADD COLUMN keywords_json TEXT NOT NULL DEFAULT '[]'")
+        except Exception:
+            pass  # Column already exists (new DB)
 
         # Create FTS5 virtual table for keyword search
         conn.execute("""
@@ -188,7 +195,7 @@ class SearchIndex:
                     json_extract(NEW.summary_json, '$.problem') || ' ' ||
                     json_extract(NEW.summary_json, '$.method') || ' ' ||
                     json_extract(NEW.summary_json, '$.findings'),
-                    json_extract(NEW.summary_json, '$.keywords'),
+                    REPLACE(REPLACE(json_extract(NEW.keywords_json, '$'), '["', ''), '"]', ''),
                     NEW.topic || ' ' || json_extract(NEW.tags_json, '$')
                 );
             END
@@ -301,72 +308,178 @@ class SearchIndex:
             self._conn.close()
             self._conn = None
 
-    async def upsert_paper(self, paper: dict[str, Any]) -> bool:
+    async def upsert_paper(self, paper: dict[str, Any]) -> dict[str, Any]:
         """Insert or update a paper in the index.
 
-        Returns True if the paper was updated (new or changed), False if unchanged.
+        Returns a dict with:
+        - content_changed: bool — True if new or changed (FTS/embedding rebuilt)
+        - graph_sync_status: str — 'ok' or 'failed'
+        - graph_sync_error: str — error message if failed, else ''
+
+        Metadata field update semantics (consistent with knowledge graph edges):
+        - key absent from paper dict → preserve existing value in papers table
+        - key present as [] / {}     → overwrite with empty collection
+        - key present with value    → overwrite with new value
+
+        Fields covered by this semantics: authors, summary, tags/topic_tags,
+        categories. All other fields (title, abstract, url, year, etc.) are
+        always written from the paper dict (missing → empty-string default).
+
+        An "effective paper" is constructed by merging the incoming paper with
+        preserved values from the existing database row. This effective paper is
+        used for content_hash computation, FTS rebuilding, and embedding generation,
+        ensuring that partial updates do not spuriously trigger re-indexing.
+
+        When a partial paper object (e.g. from PaperSaveTool) is passed,
+        fields not present in the dict are preserved, so enrichment data
+        (summary, categories, etc.) is not accidentally wiped.
         """
         paper_id = paper.get("paper_id")
         if not paper_id:
-            return False
+            return {"content_changed": False, "graph_sync_status": "skipped", "graph_sync_error": "no paper_id"}
 
-        content_hash = _compute_content_hash(paper)
         conn = self._get_conn()
 
-        # Check if paper exists and if content_hash changed
-        existing = conn.execute(
-            "SELECT content_hash FROM papers WHERE paper_id = ?", (paper_id,)
+        # Check existing row for change detection and for preserving values
+        existing_row = conn.execute(
+            "SELECT content_hash, authors_json, tags_json, categories_json, summary_json, abstract, title, keywords_json FROM papers WHERE paper_id = ?",
+            (paper_id,),
         ).fetchone()
 
-        content_changed = not existing or existing["content_hash"] != content_hash
+        # ------------------------------------------------------------------
+        # Parse nested fields using presence-aware logic.
+        # These become the serialized forms written to the DB.
+        # ------------------------------------------------------------------
 
-        # Parse nested fields (always needed for papers upsert)
-        summary = paper.get("summary", {})
-        if isinstance(summary, dict):
-            summary_json = json.dumps(summary, ensure_ascii=False)
-        elif isinstance(summary, str):
-            summary_json = json.dumps({"text": summary}, ensure_ascii=False)
+        # authors_json
+        has_authors = "authors" in paper
+        if has_authors:
+            authors = paper["authors"]
+            authors_json = json.dumps(authors if isinstance(authors, list) else [], ensure_ascii=False)
         else:
-            summary_json = "{}"
+            authors_json = existing_row["authors_json"] if existing_row else "[]"
 
-        authors = paper.get("authors", [])
-        if isinstance(authors, list):
-            authors_json = json.dumps(authors, ensure_ascii=False)
+        # tags / topic_tags
+        has_tags = "tags" in paper or "topic_tags" in paper
+        if has_tags:
+            tags = paper.get("topic_tags", paper.get("tags", []))
+            tags_json = json.dumps(tags if isinstance(tags, list) else [], ensure_ascii=False)
         else:
-            authors_json = "[]"
+            tags_json = existing_row["tags_json"] if existing_row else "[]"
 
-        tags = paper.get("topic_tags", paper.get("tags", []))
-        if isinstance(tags, list):
-            tags_json = json.dumps(tags, ensure_ascii=False)
+        # categories
+        has_categories = "categories" in paper
+        if has_categories:
+            categories = paper["categories"]
+            categories_json = json.dumps(categories if isinstance(categories, list) else [], ensure_ascii=False)
         else:
-            tags_json = "[]"
+            categories_json = existing_row["categories_json"] if existing_row else "[]"
 
-        categories = paper.get("categories", [])
-        if isinstance(categories, list):
-            categories_json = json.dumps(categories, ensure_ascii=False)
+        # summary
+        has_summary = "summary" in paper
+        if has_summary:
+            summary = paper["summary"]
+            if isinstance(summary, dict):
+                summary_json = json.dumps(summary, ensure_ascii=False)
+            elif isinstance(summary, str):
+                summary_json = json.dumps({"text": summary}, ensure_ascii=False)
+            else:
+                summary_json = "{}"
         else:
-            categories_json = "[]"
+            summary_json = existing_row["summary_json"] if existing_row else "{}"
+
+        # abstract — preserve from existing row when not in input; used in
+        # effective_paper so that _compute_content_hash is stable across
+        # partial updates that omit the abstract field.
+        has_abstract = "abstract" in paper
+        if has_abstract:
+            eff_abstract = paper["abstract"]
+        else:
+            eff_abstract = existing_row["abstract"] if existing_row else ""
+
+        # title — preserve from existing row when not in input; same reasoning
+        # as abstract: partial updates must not corrupt the stored title.
+        has_title = "title" in paper
+        if has_title:
+            eff_title = paper["title"]
+        else:
+            eff_title = existing_row["title"] if existing_row else ""
+
+        # keywords — preserve from existing row; keywords affect content_hash
+        # and _build_search_text, so omitting them in a partial update must
+        # not spuriously trigger content_changed.
+        has_keywords = "keywords" in paper
+        if has_keywords:
+            keywords = paper["keywords"]
+            keywords_json = json.dumps(keywords if isinstance(keywords, list) else [], ensure_ascii=False)
+        else:
+            keywords_json = existing_row["keywords_json"] if existing_row else "[]"
+
+        # ------------------------------------------------------------------
+        # Build effective_paper: used for all downstream indexing operations.
+        # Missing list-field keys are filled in from the existing DB row
+        # so that content_hash, FTS text, and embedding all reflect the
+        # true stored state — not the partial input.
+        # ------------------------------------------------------------------
+        try:
+            eff_authors = json.loads(authors_json)
+        except Exception:
+            eff_authors = []
+        try:
+            eff_tags = json.loads(tags_json)
+        except Exception:
+            eff_tags = []
+        try:
+            eff_categories = json.loads(categories_json)
+        except Exception:
+            eff_categories = []
+        try:
+            eff_summary = json.loads(summary_json)
+        except Exception:
+            eff_summary = {}
+        try:
+            eff_keywords = json.loads(keywords_json)
+        except Exception:
+            eff_keywords = []
+
+        effective_paper = dict(paper)  # shallow copy — start with all scalar fields
+        effective_paper["authors"] = eff_authors
+        effective_paper["tags"] = eff_tags
+        effective_paper["topic_tags"] = eff_tags
+        effective_paper["categories"] = eff_categories
+        effective_paper["summary"] = eff_summary
+        effective_paper["abstract"] = eff_abstract
+        effective_paper["title"] = eff_title
+        effective_paper["keywords"] = eff_keywords
+        # topic: derive from effective tags if not explicitly set
+        topic = paper.get("topic", "")
+        if not topic and eff_tags:
+            topic = eff_tags[0]
+
+        # ------------------------------------------------------------------
+        # Content hash and change detection use the effective paper so that
+        # partial updates (missing list fields) do not produce a different
+        # hash and do not spuriously trigger re-indexing.
+        # ------------------------------------------------------------------
+        content_hash = _compute_content_hash(effective_paper)
+        content_changed = not existing_row or existing_row["content_hash"] != content_hash
 
         external_ids = paper.get("external_ids", {})
         doi = external_ids.get("doi", paper.get("doi", ""))
         openalex_id = external_ids.get("openalex", "")
         crossref_id = external_ids.get("crossref", "")
 
-        topic = paper.get("topic", "")
-        if not topic and tags:
-            topic = tags[0] if tags else ""
-
         now = datetime.now(timezone.utc).isoformat()
 
-        # Upsert into papers
+        # Upsert into papers — all parsed values written
         conn.execute(
             """
             INSERT INTO papers (
                 paper_id, source, title, authors_json, year, venue, publication_type,
                 url, pdf_url, abstract, summary_json, topic, tags_json, categories_json,
-                doi, openalex_id, crossref_id, content_hash, updated_at,
+                keywords_json, doi, openalex_id, crossref_id, content_hash, updated_at,
                 graph_sync_status, graph_sync_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(paper_id) DO UPDATE SET
                 source=excluded.source,
                 title=excluded.title,
@@ -381,6 +494,7 @@ class SearchIndex:
                 topic=excluded.topic,
                 tags_json=excluded.tags_json,
                 categories_json=excluded.categories_json,
+                keywords_json=excluded.keywords_json,
                 doi=excluded.doi,
                 openalex_id=excluded.openalex_id,
                 crossref_id=excluded.crossref_id,
@@ -392,18 +506,19 @@ class SearchIndex:
             (
                 paper_id,
                 paper.get("source", ""),
-                paper.get("title", ""),
+                eff_title,
                 authors_json,
                 paper.get("year", ""),
                 paper.get("venue", ""),
                 paper.get("publication_type", ""),
                 paper.get("url", ""),
                 paper.get("pdf_url", ""),
-                paper.get("abstract", ""),
+                eff_abstract,
                 summary_json,
                 topic,
                 tags_json,
                 categories_json,
+                keywords_json,
                 doi,
                 openalex_id,
                 crossref_id,
@@ -414,14 +529,16 @@ class SearchIndex:
             ),
         )
 
-        # Only rebuild FTS/embeddings when text content changed (optimization)
+        # Only rebuild FTS/embeddings when text content changed.
+        # All indexing operations use effective_paper so they reflect
+        # the actual stored state, not the partial input.
         if content_changed:
-            # Rebuild FTS entry manually (triggers may not fire on INSERT OR REPLACE)
-            self._rebuild_fts_entry(conn, paper_id, paper, summary_json, topic, tags_json)
+            # Rebuild FTS entry — uses effective_paper for search text
+            self._rebuild_fts_entry(conn, paper_id, effective_paper, summary_json, topic, tags_json, eff_summary)
 
-            # Generate and store embedding if sqlite-vec is available and embedding is enabled
+            # Generate and store embedding using effective_paper
             if self._sqlite_vec_available and self.embedding_client.is_enabled():
-                await self._upsert_embedding(conn, paper_id, paper, content_hash, now)
+                await self._upsert_embedding(conn, paper_id, effective_paper, content_hash, now)
             elif self._sqlite_vec_available and not self.embedding_client.is_enabled():
                 # Embedding was previously available but now unavailable
                 # Remove stale embeddings
@@ -436,22 +553,31 @@ class SearchIndex:
                     except Exception:
                         pass
 
-        # Sync to knowledge graph (same conn, same transaction)
+        # Sync to knowledge graph — uses the original partial paper dict
+        # so that missing graph-edge fields correctly trigger "preserve" semantics.
+        graph_sync_status = "ok"
+        graph_sync_error = ""
         try:
             self._ensure_graph_initialized()
             kg = KnowledgeGraph(self)
             kg.upsert_paper(paper, commit=False)
         except Exception as e:
             logger.warning(f"Failed to sync paper {paper_id} to knowledge graph: {e}")
+            graph_sync_status = "failed"
+            graph_sync_error = str(e)[:500]
             # Record failure in papers table so it is observable
             conn.execute(
                 "UPDATE papers SET graph_sync_status = 'failed', graph_sync_error = ? WHERE paper_id = ?",
-                (str(e)[:500], paper_id),
+                (graph_sync_error, paper_id),
             )
 
         conn.commit()
 
-        return content_changed
+        return {
+            "content_changed": content_changed,
+            "graph_sync_status": graph_sync_status,
+            "graph_sync_error": graph_sync_error,
+        }
 
     def _rebuild_fts_entry(
         self,
@@ -461,12 +587,19 @@ class SearchIndex:
         summary_json: str,
         topic: str,
         tags_json: str,
+        summary: dict[str, Any] | None = None,
     ) -> None:
-        """Rebuild FTS entry for a paper."""
-        try:
-            summary = json.loads(summary_json) if summary_json != "{}" else {}
-        except Exception:
-            summary = {}
+        """Rebuild FTS entry for a paper.
+
+        Args:
+            summary: pre-parsed summary dict. If None, parsed from summary_json.
+                     Internal callers (upsert_paper) pass this to avoid re-parsing.
+        """
+        if summary is None:
+            try:
+                summary = json.loads(summary_json) if summary_json != "{}" else {}
+            except Exception:
+                summary = {}
 
         summary_text = " ".join([
             summary.get("one_sentence", ""),
@@ -474,7 +607,7 @@ class SearchIndex:
             summary.get("method", ""),
             summary.get("findings", ""),
         ])
-        keywords = ",".join(summary.get("keywords", []))
+        keywords = ",".join(paper.get("keywords", []))
         topic_tags = topic + " " + ",".join(json.loads(tags_json) if isinstance(tags_json, str) else tags_json)
 
         # Delete old FTS entry by paper_id
