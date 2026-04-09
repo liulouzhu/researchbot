@@ -310,7 +310,7 @@ class ConceptExploreTool(Tool):
     ) -> str:
         if action == "explore_topic":
             if concept_ids:
-                return await self._resume_exploration(concept_ids[0])
+                return await self._resume_exploration(concept_ids[0], top_k=top_k)
             return await self._explore_topic(topic or "", top_k)
         elif action == "explore_paper":
             return await self._explore_paper(paper_id or "", top_k)
@@ -323,7 +323,7 @@ class ConceptExploreTool(Tool):
         else:
             return f"Unknown action: {action}"
 
-    async def _resume_exploration(self, concept_id: str) -> str:
+    async def _resume_exploration(self, concept_id: str, top_k: int = 10) -> str:
         """Resume exploration at a specific concept (drill-down continuation)."""
         kg, index = _get_kg_and_index(self._workspace, self._semantic_config)
         if kg is None:

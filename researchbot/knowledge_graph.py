@@ -300,7 +300,7 @@ class KnowledgeGraph:
     def _upsert_authors(
         self, conn: sqlite3.Connection, paper_id: str, authors: list[Any], now: str
     ) -> None:
-        """Insert author nodes and collaboration edges."""
+        """Insert author nodes and collaboration edges with replace semantics."""
         # Normalize all author names first
         normalized: list[tuple[str, str]] = []  # (author_id, display_name)
         for a in authors:
@@ -310,7 +310,24 @@ class KnowledgeGraph:
             author_id = _normalize_author_id(name)
             normalized.append((author_id, name))
 
-        # Insert author nodes and build collaboration edges
+        # Replace semantics: remove old collaboration contributions for this paper
+        # Bulk decrement paper_count for all old pairs at once (avoids N+1)
+        conn.execute(
+            """
+            UPDATE author_collaborations
+            SET paper_count = MAX(0, paper_count - 1), updated_at = ?
+            WHERE (author_id_1, author_id_2) IN (
+                SELECT author_id_1, author_id_2 FROM author_collaboration_papers WHERE paper_id = ?
+            )
+            """,
+            (now, paper_id),
+        )
+        # Delete old collaboration paper records for this paper
+        conn.execute("DELETE FROM author_collaboration_papers WHERE paper_id = ?", (paper_id,))
+        # Clean up zero-count collaboration rows left behind
+        conn.execute("DELETE FROM author_collaborations WHERE paper_count <= 0")
+
+        # Insert author nodes and build new collaboration edges
         for author_id, display_name in normalized:
             conn.execute(
                 """
@@ -322,7 +339,7 @@ class KnowledgeGraph:
                 (author_id, display_name, now),
             )
 
-        # Pairwise collaboration edges
+        # Pairwise collaboration edges (re-insert with current author set)
         for i in range(len(normalized)):
             for j in range(i + 1, len(normalized)):
                 aid1, _ = normalized[i]
@@ -331,36 +348,22 @@ class KnowledgeGraph:
                 if aid1 > aid2:
                     aid1, aid2 = aid2, aid1
 
-                # Idempotent counting: only increment paper_count if this
-                # paper has not already contributed to this author pair.
-                # The author_collaboration_papers table tracks unique contributions.
-                already_counted = conn.execute(
-                    "SELECT 1 FROM author_collaboration_papers WHERE author_id_1=? AND author_id_2=? AND paper_id=?",
+                # Insert collaboration paper record
+                conn.execute(
+                    "INSERT INTO author_collaboration_papers (author_id_1, author_id_2, paper_id) VALUES (?, ?, ?)",
                     (aid1, aid2, paper_id),
-                ).fetchone()
-
-                if already_counted:
-                    # Already counted this paper for this pair — just touch timestamp
-                    conn.execute(
-                        "UPDATE author_collaborations SET updated_at=? WHERE author_id_1=? AND author_id_2=?",
-                        (now, aid1, aid2),
-                    )
-                else:
-                    # First time this paper contributes to this pair
-                    conn.execute(
-                        "INSERT INTO author_collaboration_papers (author_id_1, author_id_2, paper_id) VALUES (?, ?, ?)",
-                        (aid1, aid2, paper_id),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO author_collaborations (author_id_1, author_id_2, paper_count, updated_at)
-                        VALUES (?, ?, 1, ?)
-                        ON CONFLICT(author_id_1, author_id_2) DO UPDATE SET
-                            paper_count=author_collaborations.paper_count + 1,
-                            updated_at=excluded.updated_at
-                        """,
-                        (aid1, aid2, now),
-                    )
+                )
+                # Upsert collaboration edge (paper_count is now correct from prior decrement + insert)
+                conn.execute(
+                    """
+                    INSERT INTO author_collaborations (author_id_1, author_id_2, paper_count, updated_at)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(author_id_1, author_id_2) DO UPDATE SET
+                        paper_count=author_collaborations.paper_count + 1,
+                        updated_at=excluded.updated_at
+                    """,
+                    (aid1, aid2, now),
+                )
 
     def _upsert_related_works(
         self, conn: sqlite3.Connection, paper_id: str, related: list[str], now: str

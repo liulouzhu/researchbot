@@ -191,7 +191,8 @@ class PaperSearchLocalTool(Tool):
                     from researchbot.knowledge_graph import KnowledgeGraph
 
                     kg = index.get_graph()
-                    expanded_ids: set[str] = set()
+                    # Track source paper for each expanded paper (preserves source mapping)
+                    expanded_source: dict[str, str] = {}
 
                     # Collect cited and citing papers from initial results
                     for r in results:
@@ -201,21 +202,23 @@ class PaperSearchLocalTool(Tool):
                         # Get outbound citations (papers this paper cites)
                         cited = kg.get_cited_papers(pid, depth=expand_depth)
                         for cp in cited:
-                            expanded_ids.add(cp)
+                            if cp not in expanded_source:
+                                expanded_source[cp] = pid
                         # Get inbound citations (papers that cite this paper)
                         citing = kg.get_citing_papers(pid, depth=expand_depth)
                         for cp in citing:
-                            expanded_ids.add(cp)
+                            if cp not in expanded_source:
+                                expanded_source[cp] = pid
 
-                    if expanded_ids:
+                    if expanded_source:
                         # Fetch metadata for expanded papers
                         expanded_papers = []
-                        for eid in expanded_ids:
+                        for eid, src_pid in expanded_source.items():
                             paper = index.get_paper(eid)
                             if paper:
                                 paper["_expanded"] = True
                                 paper["final_score"] = 0.0
-                                paper["_expansion_source"] = r.get("paper_id", "")
+                                paper["_expansion_source"] = src_pid
                                 expanded_papers.append(paper)
 
                         if expanded_papers:
