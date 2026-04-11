@@ -1160,10 +1160,12 @@ class InnovationWorkflowTool(Tool):
         provider: Any = None,
         proxy: str | None = None,
         semantic_config: Any = None,
+        innovation_config: Any = None,
     ):
         self._workspace = Path(workspace) if workspace else None
         self._provider = provider
         self._proxy = proxy
+        self._innovation_config = innovation_config
         self._semantic_config = semantic_config
         self._search_index: Any = None
 
@@ -3325,7 +3327,11 @@ class InnovationWorkflowTool(Tool):
         output_dir = self._resolve_path(f"innovation/{slug}")
 
         # Store reviewer_model for use by _call_reviewer
-        self._reviewer_model = reviewer_model
+        # Priority: user-specified > config default > None (single-model mode)
+        self._reviewer_model = reviewer_model or (
+            getattr(self._innovation_config, "reviewer_model", None)
+            if self._innovation_config else None
+        )
 
         # Build workflow metadata with input params
         metadata = _workflow_info()

@@ -198,6 +198,12 @@ class LiteratureConfig(Base):
     semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
 
 
+class InnovationConfig(Base):
+    """Innovation workflow configuration."""
+
+    reviewer_model: str | None = None  # Default external reviewer model for dual-model mode
+
+
 class Config(BaseSettings):
     """Root configuration for researchbot."""
 
@@ -208,6 +214,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     literature: LiteratureConfig = Field(default_factory=LiteratureConfig)
+    innovation: InnovationConfig = Field(default_factory=InnovationConfig)
 
     @property
     def workspace_path(self) -> Path:

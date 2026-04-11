@@ -184,12 +184,14 @@ class AgentLoop:
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
         literature_config: Any = None,
+        innovation_config: Any = None,
     ):
         from researchbot.config.schema import ExecToolConfig, WebSearchConfig
 
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
+        self.innovation_config = innovation_config
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
@@ -298,7 +300,7 @@ class AgentLoop:
         self.tools.register(PaperExtractTextTool(workspace=str(self.workspace), proxy=self.web_proxy))
         self.tools.register(PaperCompareTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(PaperReviewTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
-        self.tools.register(InnovationWorkflowTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
+        self.tools.register(InnovationWorkflowTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, innovation_config=self.innovation_config, proxy=self.web_proxy))
 
         # Register Crossref/OpenAlex enrichment tools
         crossref_config = getattr(self.literature_config, "crossref", None) if self.literature_config else None
