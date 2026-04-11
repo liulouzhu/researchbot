@@ -3159,6 +3159,9 @@ class InnovationWorkflowTool(Tool):
     ) -> str:
         output_dir = self._resolve_path(f"innovation/{slug}")
 
+        # Store reviewer_model for use by _call_reviewer
+        self._reviewer_model = reviewer_model
+
         # Build workflow metadata with input params
         metadata = _workflow_info()
         iteration_params = {
@@ -3330,6 +3333,27 @@ class InnovationWorkflowTool(Tool):
             }
             metadata["stages"]["stage1_generate"]["num_candidates"] = len(candidates)
             metadata["stages"]["stage1_generate"]["note"] = "Reused existing file"
+
+            # Dual-model: external reviewer evaluates existing candidates
+            if reviewer_model:
+                try:
+                    candidates_review_content = await self._call_reviewer(
+                        EXTERNAL_REVIEWER_CANDIDATES_PROMPT,
+                        {
+                            "topic": topic,
+                            "candidates_json": json.dumps(candidates[:10], ensure_ascii=False, indent=2),
+                        },
+                    )
+                    if candidates_review_content:
+                        ext_review_path = output_dir / "candidates_review.md"
+                        content = "# External Reviewer: Candidate Assessment\n\n## Research Topic\n{topic}\n\n## Candidate Reviews\n{content}".format(
+                            topic=topic,
+                            content=_format_json_as_markdown(candidates_review_content),
+                        )
+                        with open(ext_review_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                except Exception:
+                    pass
         else:
             context = ""
             if landscape_context:
@@ -3377,6 +3401,30 @@ class InnovationWorkflowTool(Tool):
             }
             metadata["stages"]["stage1_generate"]["num_candidates"] = len(candidates)
             _save_workflow_metadata(metadata, self._workspace, topic)
+
+        # =====================================================================
+        # Dual-model: external reviewer evaluates candidates after Stage 1
+        # =====================================================================
+        candidates_review_content = None
+        if reviewer_model and not skip_stage1:
+            try:
+                candidates_review_content = await self._call_reviewer(
+                    EXTERNAL_REVIEWER_CANDIDATES_PROMPT,
+                    {
+                        "topic": topic,
+                        "candidates_json": json.dumps(candidates[:10], ensure_ascii=False, indent=2),
+                    },
+                )
+                if candidates_review_content:
+                    ext_review_path = output_dir / "candidates_review.md"
+                    content = "# External Reviewer: Candidate Assessment\n\n## Research Topic\n{topic}\n\n## Candidate Reviews\n{content}".format(
+                        topic=topic,
+                        content=_format_json_as_markdown(candidates_review_content),
+                    )
+                    with open(ext_review_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+            except Exception:
+                pass  # Silently skip if reviewer fails
 
         # =====================================================================
         # Stage 2: Novelty search (skip if already exists and not overwrite)
