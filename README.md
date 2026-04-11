@@ -46,6 +46,19 @@ pip install -e .
 uv pip install -e .
 ```
 
+### 更新
+
+```bash
+# 从 git 拉取最新代码
+git pull
+
+# 重新安装依赖
+pip install -e . --upgrade
+
+# 或使用 uv
+uv pip install -e . --upgrade
+```
+
 ### 配置
 
 首次运行需要配置 API 密钥：
