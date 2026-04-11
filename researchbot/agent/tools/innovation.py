@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 import re
 import uuid
@@ -11,6 +12,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_EXTERNAL_REVIEW_LOGGER = logging.getLogger(__name__)
 
 from researchbot.agent.tools.base import Tool
 from researchbot.utils.helpers import utc_now
@@ -552,6 +555,66 @@ def _summarize_review_report(data: dict[str, Any]) -> str:
         lines.append(f"Reasoning: {reasoning}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _build_iteration_summary(
+    rounds_data: list[dict[str, Any]],
+    final_sorted: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build iteration summary dict and flat candidate list for external reviewer."""
+    iteration_summary = {
+        "rounds_completed": len(rounds_data),
+        "final_candidates_count": len(final_sorted),
+        "rounds": [
+            {"round": rd.get("round", 0), "counts": rd.get("counts", {})}
+            for rd in rounds_data
+        ]
+    }
+    all_candidates = [
+        r.get("candidate", {})
+        for rd in rounds_data
+        for r in rd.get("results", [])
+    ]
+    return iteration_summary, all_candidates
+
+
+async def _run_external_iteration_review(
+    self,
+    topic: str,
+    output_dir: Path,
+    rounds_data: list[dict[str, Any]],
+    final_sorted: list[dict[str, Any]],
+    title: str = "External Reviewer: Iteration Independent Assessment",
+) -> None:
+    """Run external reviewer on iteration results and write review_report_external.md."""
+    model = getattr(self, "_reviewer_model", None)
+    if not model:
+        return
+    iteration_summary, all_candidates = _build_iteration_summary(rounds_data, final_sorted)
+    try:
+        result = await self._call_reviewer(
+            EXTERNAL_REVIEWER_REVIEW_PROMPT,
+            {
+                "topic": topic,
+                "review_report_summary": (
+                    f"Iteration complete: {len(rounds_data)} rounds, "
+                    f"{len(final_sorted)} final candidates. "
+                    + json.dumps(iteration_summary)
+                ),
+                "candidates_json": json.dumps(all_candidates[:10], ensure_ascii=False, indent=2),
+            },
+        )
+        if result:
+            self._write_external_review_markdown(
+                output_dir / "review_report_external.md",
+                topic,
+                result,
+                title,
+            )
+    except Exception:
+        _EXTERNAL_REVIEW_LOGGER.debug(
+            "External reviewer (iteration) failed for topic %s", topic
+        )
 
 
 def _normalize_candidate(raw: dict[str, Any]) -> dict[str, Any]:
@@ -2267,6 +2330,81 @@ class InnovationWorkflowTool(Tool):
         except Exception:
             return None
 
+    def _write_external_review_markdown(
+        self,
+        output_path: Path,
+        topic: str,
+        review_data: dict[str, Any],
+        title: str,
+    ) -> None:
+        """Write external review data as a markdown file."""
+        content = f"# {title}\n\n## Research Topic\n{topic}\n\n## External Reviews\n{_format_json_as_markdown(review_data)}"
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    async def _run_external_candidates_review(
+        self,
+        topic: str,
+        output_dir: Path,
+        candidates: list[dict[str, Any]],
+    ) -> None:
+        """Run external reviewer on candidates and write candidates_review.md."""
+        model = getattr(self, "_reviewer_model", None)
+        if not model:
+            return
+        try:
+            result = await self._call_reviewer(
+                EXTERNAL_REVIEWER_CANDIDATES_PROMPT,
+                {
+                    "topic": topic,
+                    "candidates_json": json.dumps(candidates[:10], ensure_ascii=False, indent=2),
+                },
+            )
+            if result:
+                self._write_external_review_markdown(
+                    output_dir / "candidates_review.md",
+                    topic,
+                    result,
+                    "External Reviewer: Candidate Assessment",
+                )
+        except Exception:
+            _EXTERNAL_REVIEW_LOGGER.debug(
+                "External reviewer (candidates) failed for topic %s: %%s", topic
+            )
+
+    async def _run_external_review_report(
+        self,
+        topic: str,
+        output_dir: Path,
+        review_data: dict[str, Any],
+        candidates_data: list[dict[str, Any]],
+        title: str = "External Reviewer: Independent Assessment",
+    ) -> None:
+        """Run external reviewer on a review report and write review_report_external.md."""
+        model = getattr(self, "_reviewer_model", None)
+        if not model:
+            return
+        try:
+            result = await self._call_reviewer(
+                EXTERNAL_REVIEWER_REVIEW_PROMPT,
+                {
+                    "topic": topic,
+                    "review_report_summary": _summarize_review_report(review_data),
+                    "candidates_json": json.dumps(candidates_data[:10], ensure_ascii=False, indent=2),
+                },
+            )
+            if result:
+                self._write_external_review_markdown(
+                    output_dir / "review_report_external.md",
+                    topic,
+                    result,
+                    title,
+                )
+        except Exception:
+            _EXTERNAL_REVIEW_LOGGER.debug(
+                "External reviewer (review report) failed for topic %s: %%s", topic
+            )
+
     def _build_recommendation_text(
         self,
         top_candidates: list[dict[str, Any]],
@@ -2639,7 +2777,6 @@ class InnovationWorkflowTool(Tool):
         reviewer_model: str | None = None,
     ) -> str:
         """Run multi-round iterative workflow."""
-        self._reviewer_model = reviewer_model
         innovation_dir = output_dir
 
         # If workflow already completed and overwrite=False, return cached results directly
@@ -2706,36 +2843,9 @@ class InnovationWorkflowTool(Tool):
                         )[:top_k]
                         # Dual-model: external reviewer evaluates iteration results
                         if reviewer_model:
-                            try:
-                                iteration_summary = {
-                                    "rounds_completed": len(rounds_data),
-                                    "final_candidates_count": len(final_sorted),
-                                    "rounds": [
-                                        {"round": rd.get("round", 0), "counts": rd.get("counts", {})}
-                                        for rd in rounds_data
-                                    ]
-                                }
-                                all_candidates = []
-                                for rd in rounds_data:
-                                    for r in rd.get("results", []):
-                                        all_candidates.append(r.get("candidate", {}))
-                                ext_review = await self._call_reviewer(
-                                    EXTERNAL_REVIEWER_REVIEW_PROMPT,
-                                    {
-                                        "topic": topic,
-                                        "review_report_summary": f"Iteration complete: {len(rounds_data)} rounds, {len(final_sorted)} final candidates. " + json.dumps(iteration_summary),
-                                        "candidates_json": json.dumps(all_candidates[:10], ensure_ascii=False, indent=2),
-                                    },
-                                )
-                                if ext_review:
-                                    ext_review_path = innovation_dir / "review_report_external.md"
-                                    with open(ext_review_path, "w", encoding="utf-8") as f:
-                                        f.write("# External Reviewer: Iteration Independent Assessment\n\n## Research Topic\n{topic}\n\n## External Reviews\n{content}".format(
-                                            topic=topic,
-                                            content=_format_json_as_markdown(ext_review),
-                                        ))
-                            except Exception:
-                                pass
+                            await self._run_external_iteration_review(
+                                topic, innovation_dir, rounds_data, final_sorted,
+                            )
                         return self._build_iteration_output(
                             topic, rounds_data, final_sorted,
                             stopping_reason, innovation_dir,
@@ -2976,36 +3086,9 @@ class InnovationWorkflowTool(Tool):
             )
             # Dual-model: external reviewer evaluates iteration results
             if reviewer_model:
-                try:
-                    iteration_summary = {
-                        "rounds_completed": len(rounds_data),
-                        "final_candidates_count": len(_sorted_top_candidates()),
-                        "rounds": [
-                            {"round": rd.get("round", 0), "counts": rd.get("counts", {})}
-                            for rd in rounds_data
-                        ]
-                    }
-                    all_candidates = []
-                    for rd in rounds_data:
-                        for r in rd.get("results", []):
-                            all_candidates.append(r.get("candidate", {}))
-                    ext_review = await self._call_reviewer(
-                        EXTERNAL_REVIEWER_REVIEW_PROMPT,
-                        {
-                            "topic": topic,
-                            "review_report_summary": f"Iteration complete: {len(rounds_data)} rounds, {len(_sorted_top_candidates())} final candidates. " + json.dumps(iteration_summary),
-                            "candidates_json": json.dumps(all_candidates[:10], ensure_ascii=False, indent=2),
-                        },
-                    )
-                    if ext_review:
-                        ext_review_path = innovation_dir / "review_report_external.md"
-                        with open(ext_review_path, "w", encoding="utf-8") as f:
-                            f.write("# External Reviewer: Iteration Independent Assessment\n\n## Research Topic\n{topic}\n\n## External Reviews\n{content}".format(
-                                topic=topic,
-                                content=_format_json_as_markdown(ext_review),
-                            ))
-                except Exception:
-                    pass
+                await self._run_external_iteration_review(
+                    topic, innovation_dir, rounds_data, _sorted_top_candidates(),
+                )
             return self._build_iteration_output(
                 topic, rounds_data, _sorted_top_candidates(),
                 stopping_reason, innovation_dir, iteration_report_path, iteration_md_path,
@@ -3114,36 +3197,9 @@ class InnovationWorkflowTool(Tool):
 
         # Dual-model: external reviewer evaluates iteration results
         if reviewer_model:
-            try:
-                iteration_summary = {
-                    "rounds_completed": len(rounds_data),
-                    "final_candidates_count": len(final_sorted),
-                    "rounds": [
-                        {"round": rd.get("round", 0), "counts": rd.get("counts", {})}
-                        for rd in rounds_data
-                    ]
-                }
-                all_candidates = []
-                for rd in rounds_data:
-                    for r in rd.get("results", []):
-                        all_candidates.append(r.get("candidate", {}))
-                ext_review = await self._call_reviewer(
-                    EXTERNAL_REVIEWER_REVIEW_PROMPT,
-                    {
-                        "topic": topic,
-                        "review_report_summary": f"Iteration complete: {len(rounds_data)} rounds, {len(final_sorted)} final candidates. " + json.dumps(iteration_summary),
-                        "candidates_json": json.dumps(all_candidates[:10], ensure_ascii=False, indent=2),
-                    },
-                )
-                if ext_review:
-                    ext_review_path = innovation_dir / "review_report_external.md"
-                    with open(ext_review_path, "w", encoding="utf-8") as f:
-                        f.write("# External Reviewer: Iteration Independent Assessment\n\n## Research Topic\n{topic}\n\n## External Reviews\n{content}".format(
-                            topic=topic,
-                            content=_format_json_as_markdown(ext_review),
-                        ))
-            except Exception:
-                pass
+            await self._run_external_iteration_review(
+                topic, innovation_dir, rounds_data, final_sorted,
+            )
 
         return self._build_iteration_output(
             topic, rounds_data, final_sorted,
@@ -3446,24 +3502,7 @@ class InnovationWorkflowTool(Tool):
 
             # Dual-model: external reviewer evaluates existing candidates
             if reviewer_model:
-                try:
-                    candidates_review_content = await self._call_reviewer(
-                        EXTERNAL_REVIEWER_CANDIDATES_PROMPT,
-                        {
-                            "topic": topic,
-                            "candidates_json": json.dumps(candidates[:10], ensure_ascii=False, indent=2),
-                        },
-                    )
-                    if candidates_review_content:
-                        ext_review_path = output_dir / "candidates_review.md"
-                        content = "# External Reviewer: Candidate Assessment\n\n## Research Topic\n{topic}\n\n## Candidate Reviews\n{content}".format(
-                            topic=topic,
-                            content=_format_json_as_markdown(candidates_review_content),
-                        )
-                        with open(ext_review_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                except Exception:
-                    pass
+                await self._run_external_candidates_review(topic, output_dir, candidates)
         else:
             context = ""
             if landscape_context:
@@ -3515,26 +3554,8 @@ class InnovationWorkflowTool(Tool):
         # =====================================================================
         # Dual-model: external reviewer evaluates candidates after Stage 1
         # =====================================================================
-        candidates_review_content = None
         if reviewer_model and not skip_stage1:
-            try:
-                candidates_review_content = await self._call_reviewer(
-                    EXTERNAL_REVIEWER_CANDIDATES_PROMPT,
-                    {
-                        "topic": topic,
-                        "candidates_json": json.dumps(candidates[:10], ensure_ascii=False, indent=2),
-                    },
-                )
-                if candidates_review_content:
-                    ext_review_path = output_dir / "candidates_review.md"
-                    content = "# External Reviewer: Candidate Assessment\n\n## Research Topic\n{topic}\n\n## Candidate Reviews\n{content}".format(
-                        topic=topic,
-                        content=_format_json_as_markdown(candidates_review_content),
-                    )
-                    with open(ext_review_path, "w", encoding="utf-8") as f:
-                        f.write(content)
-            except Exception:
-                pass  # Silently skip if reviewer fails
+            await self._run_external_candidates_review(topic, output_dir, candidates)
 
         # =====================================================================
         # Stage 2: Novelty search (skip if already exists and not overwrite)
@@ -3659,26 +3680,12 @@ class InnovationWorkflowTool(Tool):
 
                 # Dual-model: external reviewer independently assesses at Stage 3 (reused)
                 if self._reviewer_model:
-                    try:
-                        with open(output_dir / "review_report.json", "r", encoding="utf-8") as f:
-                            review_data_for_ext = json.load(f)
-                        ext_review = await self._call_reviewer(
-                            EXTERNAL_REVIEWER_REVIEW_PROMPT,
-                            {
-                                "topic": topic,
-                                "review_report_summary": _summarize_review_report(review_data_for_ext),
-                                "candidates_json": json.dumps([r.get("candidate", {}) for r in review_data_for_ext.get("results", [])][:10], ensure_ascii=False, indent=2),
-                            },
-                        )
-                        if ext_review:
-                            ext_review_path = output_dir / "review_report_external.md"
-                            with open(ext_review_path, "w", encoding="utf-8") as f:
-                                f.write("# External Reviewer: Independent Assessment\n\n## Research Topic\n{topic}\n\n## External Reviews\n{content}".format(
-                                    topic=topic,
-                                    content=_format_json_as_markdown(ext_review),
-                                ))
-                    except Exception:
-                        pass
+                    await self._run_external_review_report(
+                        topic, output_dir,
+                        review_data,
+                        [r.get("candidate", {}) for r in review_data.get("results", [])],
+                        "External Reviewer: Independent Assessment",
+                    )
             else:
                 # Concurrent review for all candidates
                 async def process_candidate_review(
@@ -3725,40 +3732,28 @@ class InnovationWorkflowTool(Tool):
 
                 # Dual-model: external reviewer independently assesses at Stage 3
                 if self._reviewer_model:
-                    try:
-                        review_data_for_ext = {
-                            "results": [
-                                {
-                                    "title": r.get("candidate", {}).get("title", ""),
-                                    "novelty_score": r.get("review", {}).get("novelty_score", 0),
-                                    "feasibility_score": r.get("review", {}).get("feasibility_score", 0),
-                                    "evidence_score": r.get("review", {}).get("evidence_score", 0),
-                                    "impact_score": r.get("review", {}).get("impact_score", 0),
-                                    "risk_score": r.get("review", {}).get("risk_score", 0),
-                                    "overall_score": r.get("review", {}).get("overall_score", 0),
-                                    "decision": r.get("review", {}).get("decision", ""),
-                                    "reasoning": r.get("review", {}).get("reasoning", ""),
-                                }
-                                for r in review_results
-                            ]
-                        }
-                        ext_review = await self._call_reviewer(
-                            EXTERNAL_REVIEWER_REVIEW_PROMPT,
+                    review_data_for_ext = {
+                        "results": [
                             {
-                                "topic": topic,
-                                "review_report_summary": _summarize_review_report(review_data_for_ext),
-                                "candidates_json": json.dumps([r.get("candidate", {}) for r in review_results][:10], ensure_ascii=False, indent=2),
-                            },
-                        )
-                        if ext_review:
-                            ext_review_path = output_dir / "review_report_external.md"
-                            with open(ext_review_path, "w", encoding="utf-8") as f:
-                                f.write("# External Reviewer: Independent Assessment\n\n## Research Topic\n{topic}\n\n## External Reviews\n{content}".format(
-                                    topic=topic,
-                                    content=_format_json_as_markdown(ext_review),
-                                ))
-                    except Exception:
-                        pass
+                                "title": r.get("candidate", {}).get("title", ""),
+                                "novelty_score": r.get("review", {}).get("novelty_score", 0),
+                                "feasibility_score": r.get("review", {}).get("feasibility_score", 0),
+                                "evidence_score": r.get("review", {}).get("evidence_score", 0),
+                                "impact_score": r.get("review", {}).get("impact_score", 0),
+                                "risk_score": r.get("review", {}).get("risk_score", 0),
+                                "overall_score": r.get("review", {}).get("overall_score", 0),
+                                "decision": r.get("review", {}).get("decision", ""),
+                                "reasoning": r.get("review", {}).get("reasoning", ""),
+                            }
+                            for r in review_results
+                        ]
+                    }
+                    await self._run_external_review_report(
+                        topic, output_dir,
+                        review_data_for_ext,
+                        [r.get("candidate", {}) for r in review_results],
+                        "External Reviewer: Independent Assessment",
+                    )
         else:
             metadata["stages"]["stage3_review"]["status"] = "skipped"
             metadata["stages"]["stage3_review"]["completed_at"] = utc_now()
