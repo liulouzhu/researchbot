@@ -319,11 +319,28 @@ researchbot agent -m 'innovation_workflow topic="LLM security" reviewer_model="g
 researchbot agent -m 'innovation_workflow topic="LLM security" executor_model="claude-sonnet-4-7" reviewer_model="gpt-4o"'
 ```
 
+**配置文件示例（`~/.researchbot/config.json`）：**
+
+```json
+{
+  "agents": { ... },
+  "providers": {
+    "openai": { "apiKey": "your-openai-key" },
+    "anthropic": { "apiKey": "your-anthropic-key" }
+  },
+  "innovation": {
+    "reviewer_model": "gpt-4o",
+    "provider": "openai"
+  }
+}
+```
+
 **模型优先级：**
 
 1. `executor_model` / `reviewer_model` 参数（用户指定）
-2. 配置文件中配置的默认模型
-3. `reviewer_model` 未指定时：单模型模式，现有行为完全不变
+2. 配置文件中 `innovation.reviewer_model` + `innovation.provider`（显式指定 provider 时使用对应 provider 实例）
+3. `innovation.provider` 为 `"auto"` 或未指定时：复用主 agent provider，通过模型名自动路由
+4. 全部未指定：单模型模式，现有行为完全不变
 
 **注入节点：**
 
