@@ -282,6 +282,38 @@ class SearchIndex:
                 logger.warning("Could not create paper_vectors table: {}", e)
                 self._sqlite_vec_available = False
 
+        # Create methods table - stores extracted method records
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS methods (
+                id TEXT PRIMARY KEY,
+                paper_id TEXT NOT NULL,
+                method_name TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                description TEXT NOT NULL,
+                module_interface TEXT DEFAULT '',
+                dependencies TEXT DEFAULT '[]',
+                extracted_at TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                FOREIGN KEY (paper_id) REFERENCES papers(paper_id)
+            )
+        """)
+
+        # Create method_vectors virtual table if sqlite-vec is available
+        if self._sqlite_vec_available:
+            try:
+                dim = self._vector_dim if self._vector_dim else self._config.embedding_dimension
+                if dim <= 0:
+                    dim = 1536
+                conn.execute(f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS method_vectors USING vec0(
+                        id TEXT PRIMARY KEY,
+                        embedding float[{dim}]
+                    )
+                """)
+                logger.info("method_vectors table created with dimension {}", dim)
+            except Exception as e:
+                logger.warning("Could not create method_vectors table: {}", e)
+
         conn.commit()
 
         # Initialize knowledge graph tables
@@ -578,6 +610,76 @@ class SearchIndex:
             "graph_sync_status": graph_sync_status,
             "graph_sync_error": graph_sync_error,
         }
+
+    def _compute_method_content_hash(self, method_name: str, description: str, module_interface: str) -> str:
+        """Compute a hash of method content that determines when to re-index."""
+        parts = [method_name, description, module_interface]
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+    def upsert_method(self, method_record: dict[str, Any]) -> None:
+        """Upsert a method record into the methods table.
+
+        Args:
+            method_record: Dict with keys: id, paper_id, method_name, task_type,
+                          description, module_interface (optional), dependencies (optional),
+                          extracted_at, content_hash (optional, auto-computed if missing)
+        """
+        id_ = method_record["id"]
+        paper_id = method_record["paper_id"]
+        method_name = method_record["method_name"]
+        task_type = method_record["task_type"]
+        description = method_record["description"]
+        module_interface = method_record.get("module_interface", "")
+        dependencies = json.dumps(method_record.get("dependencies", []))
+        extracted_at = method_record["extracted_at"]
+        content_hash = method_record.get("content_hash") or self._compute_method_content_hash(
+            method_name, description, module_interface
+        )
+
+        conn = self._get_conn()
+        conn.execute(
+            """
+            INSERT INTO methods (id, paper_id, method_name, task_type, description,
+                                module_interface, dependencies, extracted_at, content_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                method_name=excluded.method_name,
+                task_type=excluded.task_type,
+                description=excluded.description,
+                module_interface=excluded.module_interface,
+                dependencies=excluded.dependencies,
+                extracted_at=excluded.extracted_at,
+                content_hash=excluded.content_hash
+            """,
+            (id_, paper_id, method_name, task_type, description,
+             module_interface, dependencies, extracted_at, content_hash),
+        )
+        conn.commit()
+
+    async def upsert_method_with_vector(self, method_record: dict[str, Any]) -> None:
+        """Upsert a method record with its embedding vector.
+
+        Args:
+            method_record: Dict with keys: id, paper_id, method_name, task_type,
+                          description, module_interface (optional), dependencies (optional),
+                          extracted_at, content_hash (optional, auto-computed if missing)
+        """
+        self.upsert_method(method_record)
+
+        if self._sqlite_vec_available and self.embedding_client.is_enabled():
+            conn = self._get_conn()
+            text = f"{method_record['method_name']}: {method_record['description']}"
+            vector = await self.embedding_client.embed(text)
+            if vector is not None:
+                embedding_blob = vector_to_bytes(vector)
+                try:
+                    conn.execute(
+                        "INSERT INTO method_vectors (id, embedding) VALUES (?, ?)",
+                        (method_record["id"], embedding_blob),
+                    )
+                    conn.commit()
+                except Exception as e:
+                    logger.warning("Failed to store method vector: {}", e)
 
     def _rebuild_fts_entry(
         self,
@@ -1069,6 +1171,144 @@ Only output the JSON array, nothing else."""
                 del result[field]
 
         return result
+
+    def _row_to_method(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Convert a method row to dict."""
+        result = dict(row)
+        # Parse dependencies JSON
+        if "dependencies" in result and result["dependencies"]:
+            try:
+                result["dependencies"] = json.loads(result["dependencies"])
+            except Exception:
+                result["dependencies"] = []
+        return result
+
+    def search_methods(
+        self,
+        query: str | None = None,
+        task_type: str | None = None,
+        top_k: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Search methods by text query and/or task type filter.
+
+        Note: For vector search, use search_methods_async() instead.
+        This sync version uses LIKE-based text search when query is provided.
+
+        Args:
+            query: Search query string (uses LIKE-based search)
+            task_type: Filter by task type (e.g., classification, detection)
+            top_k: Number of results to return
+
+        Returns:
+            List of method dicts with all fields
+        """
+        conn = self._get_conn()
+        results = []
+
+        if query:
+            # LIKE-based text search
+            like_pattern = f"%{query}%"
+            sql = """
+                SELECT * FROM methods
+                WHERE (description LIKE ? OR method_name LIKE ?)
+            """
+            params = [like_pattern, like_pattern]
+            if task_type:
+                sql += " AND task_type = ?"
+                params.append(task_type)
+            sql += " ORDER BY extracted_at DESC LIMIT ?"
+            params.append(top_k)
+
+            rows = conn.execute(sql, params).fetchall()
+            for row in rows:
+                results.append(self._row_to_method(dict(row)))
+        elif task_type:
+            rows = conn.execute("""
+                SELECT * FROM methods
+                WHERE task_type = ?
+                ORDER BY extracted_at DESC
+                LIMIT ?
+            """, [task_type, top_k]).fetchall()
+            for row in rows:
+                results.append(self._row_to_method(dict(row)))
+        else:
+            # No filters - return recent methods
+            rows = conn.execute("""
+                SELECT * FROM methods
+                ORDER BY extracted_at DESC
+                LIMIT ?
+            """, [top_k]).fetchall()
+            for row in rows:
+                results.append(self._row_to_method(dict(row)))
+
+        return results
+
+    async def search_methods_async(
+        self,
+        query: str | None = None,
+        task_type: str | None = None,
+        top_k: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Async version of search_methods with proper async embedding support."""
+        conn = self._get_conn()
+        results = []
+
+        if query and self._sqlite_vec_available and self.embedding_client.is_enabled():
+            # Vector search with async embedding
+            vector = await self.embedding_client.embed(query)
+            if vector is not None:
+                try:
+                    embedding_blob = vector_to_bytes(vector)
+                    vec_rows = conn.execute("""
+                        SELECT id, distance
+                        FROM method_vectors
+                        WHERE embedding MATCH ?
+                        ORDER BY distance
+                        LIMIT ?
+                    """, [embedding_blob, top_k * 2]).fetchall()
+
+                    if vec_rows:
+                        vec_ids = [str(row["id"]) for row in vec_rows]
+                        placeholders = ",".join("?" * len(vec_ids))
+                        sql = f"""
+                            SELECT m.*, v.distance as vec_distance
+                            FROM methods m
+                            LEFT JOIN method_vectors v ON m.id = v.id
+                            WHERE m.id IN ({placeholders})
+                        """
+                        params = list(vec_ids)
+                        if task_type:
+                            sql += " AND m.task_type = ?"
+                            params.append(task_type)
+                        sql += " ORDER BY v.distance LIMIT ?"
+                        params.append(top_k)
+
+                        rows = conn.execute(sql, params).fetchall()
+                        for row in rows:
+                            results.append(self._row_to_method(dict(row)))
+                except Exception as e:
+                    logger.warning("Vector search for methods failed: {}", e)
+        else:
+            # Fall back to non-vector search
+            return self.search_methods(query=query, task_type=task_type, top_k=top_k)
+
+        return results
+
+    def get_paper_methods(self, paper_id: str) -> list[dict[str, Any]]:
+        """Get all methods for a specific paper.
+
+        Args:
+            paper_id: The paper ID to get methods for
+
+        Returns:
+            List of method dicts for the paper
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM methods WHERE paper_id = ? ORDER BY extracted_at DESC",
+            (paper_id,)
+        ).fetchall()
+        return [self._row_to_method(dict(row)) for row in rows]
 
     def count(self) -> int:
         """Get total number of indexed papers."""
