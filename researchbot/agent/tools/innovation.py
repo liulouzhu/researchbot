@@ -3004,6 +3004,8 @@ class InnovationWorkflowTool(Tool):
         stop_if_no_change: bool = True,
         enable_landscape: bool = True,
         landscape_max_online: int = 8,
+        reviewer_model: str | None = None,
+        executor_model: str | None = None,
         **kwargs: Any,
     ) -> str:
         topic = kwargs.get("topic")
@@ -3026,7 +3028,7 @@ class InnovationWorkflowTool(Tool):
                 search_online, max_related, enable_review, top_k,
                 overwrite, enable_iteration, max_rounds, min_proceed,
                 revise_top_k, stop_if_no_change, enable_landscape,
-                landscape_max_online,
+                landscape_max_online, reviewer_model, executor_model,
             )
 
     async def _execute_impl(
@@ -3047,6 +3049,8 @@ class InnovationWorkflowTool(Tool):
         stop_if_no_change: bool,
         enable_landscape: bool,
         landscape_max_online: int,
+        reviewer_model: str | None,
+        executor_model: str | None,
     ) -> str:
         output_dir = self._resolve_path(f"innovation/{slug}")
 
