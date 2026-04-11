@@ -229,6 +229,45 @@ CRITICAL: Your reasoning MUST cite specific paper_ids in brackets like [paper_id
 
 Return ONLY the JSON, no additional text."""
 
+EXTERNAL_REVIEWER_CANDIDATES_PROMPT = """You are an external research reviewer. After the executor generated initial innovation candidates, give brief critical commentary on each one.
+
+## Research Topic
+{topic}
+
+## Executor-Generated Candidates
+{candidates_json}
+
+## Your Task
+For each candidate, provide:
+1. One-sentence assessment of the idea's potential
+2. One specific weakness or risk (be direct, not vague)
+3. A suggestion for how to strengthen it
+
+Be concise. No need to re-score — just provide directional feedback.
+Return as JSON: {{"reviews": [{{"candidate_title": "...", "assessment": "...", "weakness": "...", "suggestion": "..."}}]}}
+Return ONLY the JSON."""
+
+EXTERNAL_REVIEWER_REVIEW_PROMPT = """You are an external research reviewer. Given the executor's review scores for innovation candidates, provide your own independent assessment.
+
+## Research Topic
+{topic}
+
+## Executor Review Results
+{review_report_summary}
+
+## Innovation Candidates (for reference)
+{candidates_json}
+
+## Your Task
+For each candidate, give:
+1. Whether you agree with the executor's scores (concordant or discordant)
+2. Your own brief reasoning (1-2 sentences) — cite specific concerns
+3. A final recommendation: PROCEED / REVISE / DROP
+
+Be honest about disagreements. Concordant candidates need less explanation; discordant ones need more.
+Return as JSON: {{"external_reviews": [{{"candidate_title": "...", "agreement": "concordant|discordant", "reasoning": "...", "recommendation": "PROCEED|REVISE|DROP"}}]}}
+Return ONLY the JSON."""
+
 REVISION_PROMPT = """You are a research idea refiner. Given an innovation point candidate and its review feedback, produce a revised version that addresses the identified weaknesses.
 
 ## Original Candidate
@@ -475,6 +514,44 @@ def _parse_json_robust(content: str, expect_array: bool = True) -> list[dict[str
             pass
 
     return None
+
+
+def _format_json_as_markdown(data: dict[str, Any]) -> str:
+    """Format a dict as readable markdown."""
+    lines = []
+    if "reviews" in data:
+        for r in data["reviews"]:
+            lines.append(f"### {r.get('candidate_title', 'Unknown')}")
+            lines.append(f"- **Assessment**: {r.get('assessment', 'N/A')}")
+            lines.append(f"- **Weakness**: {r.get('weakness', 'N/A')}")
+            lines.append(f"- **Suggestion**: {r.get('suggestion', 'N/A')}")
+            lines.append("")
+    elif "external_reviews" in data:
+        for r in data["external_reviews"]:
+            lines.append(f"### {r.get('candidate_title', 'Unknown')}")
+            lines.append(f"- **Agreement**: {r.get('agreement', 'N/A')}")
+            lines.append(f"- **Reasoning**: {r.get('reasoning', 'N/A')}")
+            lines.append(f"- **Recommendation**: {r.get('recommendation', 'N/A')}")
+            lines.append("")
+    return "\n".join(lines) if lines else str(data)
+
+
+def _summarize_review_report(data: dict[str, Any]) -> str:
+    """Extract a compact summary of the review report for the external reviewer."""
+    results = data.get("results", [])
+    lines = [f"Total candidates reviewed: {len(results)}\n"]
+    for r in results[:10]:
+        lines.append(f"### {r.get('title', r.get('candidate_title', 'Unknown'))}")
+        lines.append(f"novelty={r.get('novelty_score', 'N/A')}, feasibility={r.get('feasibility_score', 'N/A')}, "
+                     f"evidence={r.get('evidence_score', 'N/A')}, impact={r.get('impact_score', 'N/A')}, "
+                     f"risk={r.get('risk_score', 'N/A')}, overall={r.get('overall_score', 'N/A')}")
+        lines.append(f"Decision: {r.get('decision', 'N/A')}")
+        reasoning = r.get('reasoning', 'N/A')
+        if isinstance(reasoning, str):
+            reasoning = reasoning[:200]
+        lines.append(f"Reasoning: {reasoning}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _normalize_candidate(raw: dict[str, Any]) -> dict[str, Any]:
@@ -2151,6 +2228,34 @@ class InnovationWorkflowTool(Tool):
             f.writelines(lines)
 
         return str(json_path), str(md_path)
+
+    async def _call_reviewer(
+        self,
+        prompt_template: str,
+        format_kwargs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Call the external reviewer model via the existing provider.
+
+        Returns parsed JSON dict on success, None on failure.
+        Silently returns None if reviewer_model is not configured or provider is missing.
+        """
+        if not self._provider:
+            return None
+
+        model = getattr(self, "_reviewer_model", None)
+        if not model:
+            return None
+
+        prompt = prompt_template.format(**format_kwargs)
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            response = await self._provider.chat_with_retry(messages, model=model)
+            content = response.content or ""
+            result = _parse_json_robust(content, expect_array=False)
+            return result
+        except Exception:
+            return None
 
     def _build_recommendation_text(
         self,
