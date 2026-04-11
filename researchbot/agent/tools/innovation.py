@@ -3546,6 +3546,29 @@ class InnovationWorkflowTool(Tool):
                 metadata["stages"]["stage3_review"]["num_candidates"] = len(review_results)
                 metadata["stages"]["stage3_review"]["note"] = "Reused existing file"
                 _save_workflow_metadata(metadata, self._workspace, topic)
+
+                # Dual-model: external reviewer independently assesses at Stage 3 (reused)
+                if self._reviewer_model:
+                    try:
+                        with open(output_dir / "review_report.json", "r", encoding="utf-8") as f:
+                            review_data_for_ext = json.load(f)
+                        ext_review = await self._call_reviewer(
+                            EXTERNAL_REVIEWER_REVIEW_PROMPT,
+                            {
+                                "topic": topic,
+                                "review_report_summary": _summarize_review_report(review_data_for_ext),
+                                "candidates_json": json.dumps([r.get("candidate", {}) for r in review_data_for_ext.get("results", [])][:10], ensure_ascii=False, indent=2),
+                            },
+                        )
+                        if ext_review:
+                            ext_review_path = output_dir / "review_report_external.md"
+                            with open(ext_review_path, "w", encoding="utf-8") as f:
+                                f.write("# External Reviewer: Independent Assessment\n\n## Research Topic\n{topic}\n\n## External Reviews\n{content}".format(
+                                    topic=topic,
+                                    content=_format_json_as_markdown(ext_review),
+                                ))
+                    except Exception:
+                        pass
             else:
                 # Concurrent review for all candidates
                 async def process_candidate_review(
@@ -3589,6 +3612,43 @@ class InnovationWorkflowTool(Tool):
                 }
                 metadata["stages"]["stage3_review"]["num_candidates"] = len(review_results)
                 _save_workflow_metadata(metadata, self._workspace, topic)
+
+                # Dual-model: external reviewer independently assesses at Stage 3
+                if self._reviewer_model:
+                    try:
+                        review_data_for_ext = {
+                            "results": [
+                                {
+                                    "title": r.get("candidate", {}).get("title", ""),
+                                    "novelty_score": r.get("review", {}).get("novelty_score", 0),
+                                    "feasibility_score": r.get("review", {}).get("feasibility_score", 0),
+                                    "evidence_score": r.get("review", {}).get("evidence_score", 0),
+                                    "impact_score": r.get("review", {}).get("impact_score", 0),
+                                    "risk_score": r.get("review", {}).get("risk_score", 0),
+                                    "overall_score": r.get("review", {}).get("overall_score", 0),
+                                    "decision": r.get("review", {}).get("decision", ""),
+                                    "reasoning": r.get("review", {}).get("reasoning", ""),
+                                }
+                                for r in review_results
+                            ]
+                        }
+                        ext_review = await self._call_reviewer(
+                            EXTERNAL_REVIEWER_REVIEW_PROMPT,
+                            {
+                                "topic": topic,
+                                "review_report_summary": _summarize_review_report(review_data_for_ext),
+                                "candidates_json": json.dumps([r.get("candidate", {}) for r in review_results][:10], ensure_ascii=False, indent=2),
+                            },
+                        )
+                        if ext_review:
+                            ext_review_path = output_dir / "review_report_external.md"
+                            with open(ext_review_path, "w", encoding="utf-8") as f:
+                                f.write("# External Reviewer: Independent Assessment\n\n## Research Topic\n{topic}\n\n## External Reviews\n{content}".format(
+                                    topic=topic,
+                                    content=_format_json_as_markdown(ext_review),
+                                ))
+                    except Exception:
+                        pass
         else:
             metadata["stages"]["stage3_review"]["status"] = "skipped"
             metadata["stages"]["stage3_review"]["completed_at"] = utc_now()
