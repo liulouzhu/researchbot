@@ -723,6 +723,286 @@ class KnowledgeGraph:
             return []
 
     # -------------------------------------------------------------------------
+    # Co-citation analysis and recommendation
+    # -------------------------------------------------------------------------
+
+    def find_cocitation_candidates(
+        self,
+        paper_ids: list[str],
+        min_count: int = 1,
+    ) -> list[tuple[str, int, int]]:
+        """Find papers cited by at least min_count of the given papers.
+
+        Unlike find_common_citations (intersection), this returns candidates
+        with varying coverage levels, enabling threshold-based ranking.
+
+        Args:
+            paper_ids: List of paper IDs (the "collection")
+            min_count: Minimum number of input papers that must cite a candidate
+                       (1 = all cited papers, 2 = cited by at least 2, etc.)
+
+        Returns:
+            List of (paper_id, matched_count, total_citation_count) tuples,
+            sorted by matched_count descending, then total_citation_count descending.
+            - matched_count: how many of the input papers cite this candidate
+            - total_citation_count: total citations across the entire graph
+        """
+        if not paper_ids or min_count < 1:
+            return []
+        conn = self._conn()
+        placeholders = ",".join("?" * len(paper_ids))
+
+        # Get candidates with their coverage among input papers and global citation count
+        rows = conn.execute(
+            f"""
+            SELECT
+                ce.cited_paper_id AS paper_id,
+                COUNT(DISTINCT ce.citing_paper_id) AS matched_count
+            FROM citation_edges ce
+            WHERE ce.citing_paper_id IN ({placeholders})
+            GROUP BY ce.cited_paper_id
+            HAVING matched_count >= ?
+            ORDER BY matched_count DESC
+            """,
+            paper_ids + [min_count],
+        ).fetchall()
+        candidate_ids = [r["paper_id"] for r in rows]
+
+        # Batch-fetch total citation counts for all candidates (avoids correlated subquery)
+        if candidate_ids:
+            c_placeholders = ",".join("?" * len(candidate_ids))
+            total_rows = conn.execute(
+                f"SELECT cited_paper_id, COUNT(*) AS total_citations FROM citation_edges WHERE cited_paper_id IN ({c_placeholders}) GROUP BY cited_paper_id",
+                candidate_ids,
+            ).fetchall()
+            total_map = {r["cited_paper_id"]: r["total_citations"] for r in total_rows}
+        else:
+            total_map = {}
+
+        result = []
+        for r in rows:
+            pid = r["paper_id"]
+            matched = r["matched_count"]
+            total = total_map.get(pid, 0)
+            result.append((pid, matched, total))
+
+        # Sort by matched_count desc, total_citations desc
+        result.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        return result
+
+    def recommend_cocited_papers(
+        self,
+        paper_ids: list[str],
+        *,
+        min_count: int = 1,
+        concept_id: str | None = None,
+        year_from: int | None = None,
+        year_to: int | None = None,
+        top_k: int = 20,
+        use_time_decay: bool = False,
+        current_year: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Recommend foundational papers based on co-citation analysis.
+
+        Given a set of papers (e.g., a user's collection), finds papers that
+        are frequently cited together by these papers — suggesting foundational
+        influence on the collection.
+
+        Scoring:
+            score = matched_count * coverage_boost * concept_boost * time_decay
+            - matched_count: how many collection papers cite this candidate
+            - coverage_boost: 1 + matched_count / len(paper_ids)  (favor high coverage)
+            - concept_boost: 2.0 if concept matches, else 1.0
+            - time_decay: pow(0.95, age_in_years) if enabled, else 1.0
+
+        Args:
+            paper_ids: List of paper IDs in the collection
+            min_count: Minimum number of collection papers that must cite a candidate
+            concept_id: If set, boost papers that have this concept
+            year_from: If set, only include papers published >= year_from
+            year_to: If set, only include papers published <= year_to
+            top_k: Maximum number of results to return
+            use_time_decay: If True, apply exponential time decay (favor recent papers)
+            current_year: Year to use for time decay calculation (default: current year)
+
+        Returns:
+            List of recommendation dicts with keys:
+                paper_id, title, year, citation_count, matched_count,
+                matched_paper_ids, matched_concepts, score, explanation
+        """
+        if not paper_ids:
+            return []
+
+        if current_year is None:
+            from datetime import datetime
+            current_year = datetime.now().year
+
+        # Get candidates
+        candidates = self.find_cocitation_candidates(paper_ids, min_count=min_count)
+        if not candidates:
+            return []
+
+        candidate_ids = [pid for pid, _, _ in candidates]
+
+        # Load metadata for all candidates in one query
+        conn = self._conn()
+        placeholders = ",".join("?" * len(candidate_ids))
+
+        # Get citation_count from citation_edges (total inbound citations)
+        cite_count_rows = conn.execute(
+            f"""
+            SELECT cited_paper_id, COUNT(*) AS citation_count
+            FROM citation_edges
+            WHERE cited_paper_id IN ({placeholders})
+            GROUP BY cited_paper_id
+            """,
+            candidate_ids,
+        ).fetchall()
+        cite_count_map = {r["cited_paper_id"]: r["citation_count"] for r in cite_count_rows}
+
+        meta_rows = conn.execute(
+            f"""
+            SELECT p.paper_id, p.title, p.year,
+                   GROUP_CONCAT(pc.concept_id) AS concept_ids
+            FROM papers p
+            LEFT JOIN paper_concepts pc ON p.paper_id = pc.paper_id
+            WHERE p.paper_id IN ({placeholders})
+            GROUP BY p.paper_id
+            """,
+            candidate_ids,
+        ).fetchall()
+
+        meta_map: dict[str, dict[str, Any]] = {}
+        for r in meta_rows:
+            concept_ids = []
+            if r["concept_ids"]:
+                concept_ids = [c.strip() for c in r["concept_ids"].split(",") if c.strip()]
+            meta_map[r["paper_id"]] = {
+                "title": r["title"] or r["paper_id"],
+                "year": r["year"] or "",
+                "citation_count": cite_count_map.get(r["paper_id"], 0),
+                "concept_ids": concept_ids,
+            }
+
+        # For candidates without metadata, create minimal entries
+        for pid, _, total_citations in candidates:
+            if pid not in meta_map:
+                meta_map[pid] = {
+                    "title": pid,
+                    "year": "",
+                    "citation_count": total_citations,
+                    "concept_ids": [],
+                }
+
+        # Get which input papers cite each candidate
+        cited_placeholders = ",".join("?" * len(candidate_ids))
+        citing_placeholders = ",".join("?" * len(paper_ids))
+        citing_rows = conn.execute(
+            f"""
+            SELECT cited_paper_id, citing_paper_id
+            FROM citation_edges
+            WHERE cited_paper_id IN ({cited_placeholders})
+              AND citing_paper_id IN ({citing_placeholders})
+            """,
+            candidate_ids + paper_ids,
+        ).fetchall()
+
+        # Build citing_papers map: candidate_id -> list of citing input paper_ids
+        citing_map: dict[str, set[str]] = {pid: set() for pid in candidate_ids}
+        for r in citing_rows:
+            citing_map[r["cited_paper_id"]].add(r["citing_paper_id"])
+
+        # Normalize concept_id for comparison
+        safe_concept = _safe_id(concept_id) if concept_id else None
+
+        # Batch-fetch all concept display names for all candidates (avoids N+1 loop queries)
+        all_concept_ids: set[str] = set()
+        for pid, _, _ in candidates:
+            all_concept_ids.update(meta_map.get(pid, {}).get("concept_ids", []))
+        if all_concept_ids:
+            c_ph = ",".join("?" * len(all_concept_ids))
+            concept_rows = conn.execute(
+                f"SELECT concept_id, display_name FROM concepts WHERE concept_id IN ({c_ph})",
+                list(all_concept_ids),
+            ).fetchall()
+            concept_map: dict[str, str] = {r["concept_id"]: r["display_name"] for r in concept_rows}
+        else:
+            concept_map = {}
+
+        # Score and filter
+        results: list[dict[str, Any]] = []
+        collection_size = len(paper_ids)
+
+        for paper_id, matched_count, total_citations in candidates:
+            meta = meta_map.get(paper_id, {})
+
+            # Year filter
+            try:
+                year = int(meta.get("year", 0)) if meta.get("year") else 0
+            except (ValueError, TypeError):
+                year = 0
+
+            if year_from is not None and year < year_from:
+                continue
+            if year_to is not None and year > year_to:
+                continue
+
+            # Compute score components
+            coverage_ratio = matched_count / collection_size
+            coverage_boost = 1.0 + coverage_ratio
+
+            concept_ids = meta.get("concept_ids", [])
+            concept_boost = 2.0 if (safe_concept and safe_concept in concept_ids) else 1.0
+
+            if use_time_decay and year > 0:
+                age = current_year - year
+                time_decay = pow(0.95, max(0, age))
+            else:
+                time_decay = 1.0
+
+            score = matched_count * coverage_boost * concept_boost * time_decay
+
+            # Build explanation
+            matched_list = sorted(citing_map.get(paper_id, set()))
+            if matched_count == collection_size:
+                explanation = (
+                    f"Foundational paper cited by all {matched_count} collection papers. "
+                    f"Citations in collection: {matched_count}, total citations: {total_citations}."
+                )
+            else:
+                explanation = (
+                    f"Cited by {matched_count} of {collection_size} collection papers "
+                    f"({coverage_ratio:.0%} coverage). Total citations: {total_citations}."
+                )
+
+            if safe_concept and safe_concept in concept_ids:
+                explanation += f" Matches concept filter."
+            if use_time_decay and year > 0:
+                explanation += f" Time decay applied (age={current_year - year} years)."
+
+            matched_concepts = [
+                {"concept_id": cid, "display_name": concept_map.get(cid, cid)}
+                for cid in concept_ids
+            ]
+
+            results.append({
+                "paper_id": paper_id,
+                "title": meta.get("title", paper_id),
+                "year": meta.get("year", ""),
+                "citation_count": meta.get("citation_count", total_citations),
+                "matched_count": matched_count,
+                "matched_paper_ids": matched_list,
+                "matched_concepts": matched_concepts,
+                "score": round(score, 4),
+                "explanation": explanation,
+            })
+
+        # Sort by score descending
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        return results[:top_k]
+
+    # -------------------------------------------------------------------------
     # Bulk operations
     # -------------------------------------------------------------------------
 

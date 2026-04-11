@@ -439,6 +439,7 @@ class GraphQueryTool(Tool):
                     "find_path",
                     "get_related_papers",
                     "stats",
+                    "recommend_cocited_papers",
                 ],
             },
             "paper_id": {
@@ -479,6 +480,31 @@ class GraphQueryTool(Tool):
                 "minimum": 1,
                 "maximum": 50,
                 "default": 20,
+            },
+            "min_count": {
+                "type": "integer",
+                "description": "Minimum number of collection papers that must cite a candidate (default 1)",
+                "minimum": 1,
+                "default": 1,
+            },
+            "year_from": {
+                "type": "integer",
+                "description": "Filter by year >= this value",
+            },
+            "year_to": {
+                "type": "integer",
+                "description": "Filter by year <= this value",
+            },
+            "use_time_decay": {
+                "type": "boolean",
+                "description": "Apply time decay to favor recent papers (default False)",
+                "default": False,
+            },
+            "output_format": {
+                "type": "string",
+                "description": "Output format for recommend_cocited_papers: 'text' or 'json'",
+                "enum": ["text", "json"],
+                "default": "text",
             },
         },
         "required": ["operation"],
@@ -715,6 +741,46 @@ class GraphQueryTool(Tool):
                         step_lines.append(f"    {'→' if i > 0 else ''}{title} ({year}) [{pid}]")
                     lines.append(f"  Path {pi}:")
                     lines.extend(step_lines)
+                return "\n".join(lines)
+
+            if operation == "recommend_cocited_papers":
+                if not paper_ids or len(paper_ids) < 1:
+                    return "Error: paper_ids (list of paper IDs) is required for recommend_cocited_papers"
+                recommendations = kg.recommend_cocited_papers(
+                    paper_ids,
+                    min_count=kwargs.get("min_count", 1),
+                    concept_id=concept_id,
+                    year_from=kwargs.get("year_from"),
+                    year_to=kwargs.get("year_to"),
+                    top_k=top_k,
+                    use_time_decay=kwargs.get("use_time_decay", False),
+                )
+                if not recommendations:
+                    return (
+                        f"No co-citation recommendations found for the given collection "
+                        f"(paper_ids={paper_ids}). Try lowering min_count or check if "
+                        f"citation edges exist for these papers in the graph."
+                    )
+                output_format = kwargs.get("output_format", "text")
+                if output_format == "json":
+                    import json
+                    return json.dumps(recommendations, ensure_ascii=False, indent=2)
+                # Text output
+                lines = [
+                    f"Co-citation recommendations for collection of {len(paper_ids)} papers:\n",
+                    f"Found {len(recommendations)} recommended foundational papers\n",
+                    "-" * 60,
+                ]
+                for i, rec in enumerate(recommendations, 1):
+                    lines.append(f"\n{i}. {rec['title']}")
+                    lines.append(f"   Paper ID: {rec['paper_id']}")
+                    lines.append(f"   Year: {rec['year']} | Citations: {rec['citation_count']}")
+                    lines.append(f"   Matched: {rec['matched_count']}/{len(paper_ids)} collection papers")
+                    lines.append(f"   Score: {rec['score']:.4f}")
+                    if rec["matched_concepts"]:
+                        concept_names = [c["display_name"] for c in rec["matched_concepts"][:3]]
+                        lines.append(f"   Concepts: {', '.join(concept_names)}")
+                    lines.append(f"   {rec['explanation']}")
                 return "\n".join(lines)
 
             return f"Unknown operation: {operation}"

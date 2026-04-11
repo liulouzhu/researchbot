@@ -14,6 +14,7 @@
 - **Crossref搜索** (`crossref_search`): 直接搜索 Crossref 数据库
 - **OpenAlex搜索** (`openalex_search`): 直接搜索 OpenAlex 数据库
 - **引文导出** (`paper_cite`): 将论文导出为 BibTeX、RIS、CSL-JSON、APA、MLA、GB/T 7714 格式
+- **创新点生成** (`innovation_workflow`): 从研究主题出发，经历候选生成 → 查新评估 → 审阅评分 → 多轮迭代收敛四个阶段
 
 ### 2. 智能代理
 - 支持多种大语言模型 (OpenAI GPT, Anthropic Claude, 本地 Ollama 等)
@@ -166,6 +167,26 @@ researchbot rebuild-graph --workspace /path/to/workspace
 - `rebuild the graph`
 
 系统会调用 `knowledge_graph_rebuild` 工具完成重建。
+
+#### 共引推荐
+
+给定一组收藏论文，找出被这些论文高频共同引用的基础论文，并返回可排序的推荐列表。
+
+```
+graph_query(
+    operation="recommend_cocited_papers",
+    paper_ids=["id1", "id2", ...],
+    min_count=1,           # 最少被几篇收藏论文引用
+    concept_id="...",      # 可选：概念过滤
+    year_from=2010,        # 可选：最早年份
+    year_to=2024,          # 可选：最晚年份
+    top_k=20,
+    use_time_decay=False,  # 默认关闭，偏爱经典论文
+    output_format="text",   # text 或 json
+)
+```
+
+评分公式：`score = matched_count × coverage_boost × concept_boost × time_decay`
 
 ### 使用
 
