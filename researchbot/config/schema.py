@@ -202,6 +202,7 @@ class InnovationConfig(Base):
     """Innovation workflow configuration."""
 
     reviewer_model: str | None = None  # Default external reviewer model for dual-model mode
+    provider: str | None = None  # Default provider for the reviewer model (e.g. "openai", "anthropic", "auto")
 
 
 class Config(BaseSettings):

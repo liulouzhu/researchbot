@@ -1161,13 +1161,54 @@ class InnovationWorkflowTool(Tool):
         proxy: str | None = None,
         semantic_config: Any = None,
         innovation_config: Any = None,
+        config: Any = None,
     ):
         self._workspace = Path(workspace) if workspace else None
         self._provider = provider
         self._proxy = proxy
         self._innovation_config = innovation_config
         self._semantic_config = semantic_config
+        self._config = config
+        self._reviewer_provider: Any = None
         self._search_index: Any = None
+
+    def _resolve_reviewer_provider(
+        self, provider_cfg: str | None, reviewer_model: str | None
+    ) -> Any | None:
+        """Resolve the LLM provider for the reviewer.
+
+        Priority: explicit provider_cfg > fall back to main agent provider.
+        Returns an LLMProvider instance, or None to use the main agent provider.
+        """
+        if not self._config or not provider_cfg or provider_cfg == "auto":
+            return None
+
+        from researchbot.providers.registry import find_by_name
+
+        spec = find_by_name(provider_cfg)
+        if not spec:
+            return None
+        p = getattr(self._config.providers, spec.name, None)
+        if not p or not p.api_key:
+            return None
+
+        # Map backend name to provider class
+        backend_map = {
+            "openai_compat": "OpenAICompatProvider",
+            "anthropic": "AnthropicProvider",
+            "azure_openai": "AzureOpenAIProvider",
+            "openai_codex": "OpenAICodexProvider",
+        }
+        cls_name = backend_map.get(spec.backend)
+        if not cls_name:
+            return None
+
+        import importlib
+
+        module = importlib.import_module(f"researchbot.providers.{spec.backend}_provider")
+        cls = getattr(module, cls_name)
+        default_model = reviewer_model or (self._reviewer_model)
+        return cls(api_key=p.api_key or None, api_base=p.api_base or None, default_model=default_model)
 
     def _resolve_path(self, path: str) -> Path:
         if not self._workspace:
@@ -2309,23 +2350,25 @@ class InnovationWorkflowTool(Tool):
         prompt_template: str,
         format_kwargs: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Call the external reviewer model via the existing provider.
+        """Call the external reviewer model via the configured provider.
 
         Returns parsed JSON dict on success, None on failure.
         Silently returns None if reviewer_model is not configured or provider is missing.
         """
-        if not self._provider:
-            return None
-
         model = getattr(self, "_reviewer_model", None)
         if not model:
+            return None
+
+        # Use dedicated reviewer provider if configured, otherwise fall back to main provider
+        provider = self._reviewer_provider or self._provider
+        if not provider:
             return None
 
         prompt = prompt_template.format(**format_kwargs)
         messages = [{"role": "user", "content": prompt}]
 
         try:
-            response = await self._provider.chat_with_retry(messages, model=model)
+            response = await provider.chat_with_retry(messages, model=model)
             content = response.content or ""
             result = _parse_json_robust(content, expect_array=False)
             return result
@@ -3326,11 +3369,18 @@ class InnovationWorkflowTool(Tool):
     ) -> str:
         output_dir = self._resolve_path(f"innovation/{slug}")
 
-        # Store reviewer_model for use by _call_reviewer
+        # Store reviewer_model and reviewer_provider for use by _call_reviewer
         # Priority: user-specified > config default > None (single-model mode)
         self._reviewer_model = reviewer_model or (
             getattr(self._innovation_config, "reviewer_model", None)
             if self._innovation_config else None
+        )
+        reviewer_provider_cfg = (
+            getattr(self._innovation_config, "provider", None)
+            if self._innovation_config else None
+        )
+        self._reviewer_provider = self._resolve_reviewer_provider(
+            reviewer_provider_cfg, self._reviewer_model
         )
 
         # Build workflow metadata with input params

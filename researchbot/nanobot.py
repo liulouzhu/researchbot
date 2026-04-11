@@ -81,6 +81,7 @@ class Nanobot:
             timezone=defaults.timezone,
             literature_config=config.literature,
             innovation_config=config.innovation,
+            config=config,
         )
         return cls(loop)
 
