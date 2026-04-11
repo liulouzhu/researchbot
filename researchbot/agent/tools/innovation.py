@@ -1074,6 +1074,16 @@ class InnovationWorkflowTool(Tool):
                 "maximum": 30,
                 "default": 8,
             },
+            "reviewer_model": {
+                "type": "string",
+                "nullable": True,
+                "description": "External reviewer model for dual-model collaboration (e.g. 'gpt-4o', 'claude-sonnet-4-7'). When null, runs in single-model mode (default: null)",
+            },
+            "executor_model": {
+                "type": "string",
+                "nullable": True,
+                "description": "Override the executor model for this workflow run (e.g. 'gpt-4o', 'claude-sonnet-4-7'). Uses config default when null (default: null)",
+            },
         },
         "required": ["topic"],
     }
