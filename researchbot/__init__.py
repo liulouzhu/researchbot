@@ -7,4 +7,4 @@ __logo__ = "🐈"
 
 from researchbot.nanobot import Nanobot, RunResult
 
-__all__ = ["Nanobot", "RunResult"]
+__all__ = ["ResearchBot", "RunResult"]
