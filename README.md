@@ -14,7 +14,7 @@
 - **Crossref搜索** (`crossref_search`): 直接搜索 Crossref 数据库
 - **OpenAlex搜索** (`openalex_search`): 直接搜索 OpenAlex 数据库
 - **引文导出** (`paper_cite`): 将论文导出为 BibTeX、RIS、CSL-JSON、APA、MLA、GB/T 7714 格式
-- **创新点生成** (`innovation_workflow`): 从研究主题出发，经历候选生成 → 查新评估 → 审阅评分 → 多轮迭代收敛四个阶段
+- **创新点生成** (`innovation_workflow`): 从研究主题出发，经历候选生成 → 查新评估 → 审阅评分 → 多轮迭代收敛四个阶段；支持双模型协作，引入外部评审者打破单一模型思维盲点
 
 ### 2. 智能代理
 - 支持多种大语言模型 (OpenAI GPT, Anthropic Claude, 本地 Ollama 等)
@@ -302,6 +302,47 @@ innovation/<topic_slug>/
 - 无更多可修订的候选
 
 **创新线去重：** 迭代模式下，同一 `parent_candidate`（或原始 title）的多个修订版本会按 lineage 去重，仅保留得分最高者，确保 top-K 推荐覆盖不同创新线。
+
+#### 双模型协作模式
+
+`innovation_workflow` 支持双模型协作：执行器（Executor）负责生成候选和审阅评分，外部评审者（Reviewer）提供独立的批评意见，帮助打破单一模型的思维盲点。
+
+**核心思路：** 同一模型自我评审容易陷入局部最优——跨模型评审能主动发现执行器未预料到的弱点，类似于对抗性 bandits vs 随机性 bandits 的区别。
+
+**启用方式：**
+
+```bash
+# 指定外部评审者模型（优先级高于配置默认值）
+researchbot agent -m 'innovation_workflow topic="LLM security" reviewer_model="gpt-4o"'
+
+# 指定执行器和评审者模型
+researchbot agent -m 'innovation_workflow topic="LLM security" executor_model="claude-sonnet-4-7" reviewer_model="gpt-4o"'
+```
+
+**模型优先级：**
+
+1. `executor_model` / `reviewer_model` 参数（用户指定）
+2. 配置文件中配置的默认模型
+3. `reviewer_model` 未指定时：单模型模式，现有行为完全不变
+
+**注入节点：**
+
+| 阶段 | 评审者行为 |
+|------|-----------|
+| Stage 1 后（候选生成完成） | 对每个候选给出简短评价：潜力、弱点、强化建议 |
+| Stage 3 后（评审打分完成） | 独立评审，与执行器评分对比，标注 concordant/discordant |
+| Stage 4（迭代模式） | 每轮迭代结束时对修订候选做独立评估 |
+
+**输出文件（双模型模式新增）：**
+
+```
+innovation/<topic_slug>/
+├── candidates_review.md        # 外部评审者对候选的简短评语
+├── review_report_external.md   # 外部评审者的独立评审意见
+└── ...
+```
+
+> 单模型模式（不指定 `reviewer_model`）：目录结构与原有完全一致，无新增文件。
 
 #### 引文导出
 
