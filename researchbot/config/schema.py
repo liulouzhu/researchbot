@@ -190,12 +190,24 @@ class SemanticSearchConfig(Base):
     vector_weight: float = 0.7  # 向量检索权重
 
 
+class MethodExtractionConfig(Base):
+    """Method extraction configuration for extracting methods from saved papers."""
+
+    model: str = "claude-sonnet-4-5"
+    embedding_provider: str = "dashscope"
+    embedding_model: str = "text-embedding-v4"
+    embedding_dimension: int = 1024
+    top_k: int = 10
+    auto_extract: bool = True  # 自动从保存的论文提取方法
+
+
 class LiteratureConfig(Base):
     """Literature/paper tools configuration."""
 
     crossref: CrossrefConfig = Field(default_factory=CrossrefConfig)
     openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
     semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
+    method_extraction: MethodExtractionConfig = Field(default_factory=MethodExtractionConfig)  # 新增
 
 
 class InnovationConfig(Base):
