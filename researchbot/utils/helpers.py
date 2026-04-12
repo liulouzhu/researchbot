@@ -305,3 +305,35 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         for name in added:
             Console().print(f"  [dim]Created {name}[/dim]")
     return added
+
+
+def compute_short_id(content: str, prefix: str = "", length: int = 16) -> str:
+    """Generate a short hex ID from content using SHA256.
+
+    Args:
+        content: String to hash
+        prefix: Optional prefix prepended before hashing
+        length: Number of hex characters to return (default 16)
+
+    Returns:
+        Hex string of specified length
+    """
+    import hashlib
+    data = (prefix + content).encode() if prefix else content.encode()
+    return hashlib.sha256(data).hexdigest()[:length]
+
+
+def extract_json_array(text: str) -> list | None:
+    """Extract first JSON array from text that may have surrounding content.
+
+    Looks for [... ] pattern and returns the parsed array, or None if not found.
+    """
+    json_start = text.find("[")
+    json_end = text.rfind("]") + 1
+    if json_start >= 0 and json_end > json_start:
+        json_str = text[json_start:json_end]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            return None
+    return None

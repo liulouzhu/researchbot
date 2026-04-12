@@ -18,8 +18,9 @@ from researchbot.agent.tools.arxiv_client import (
     search_arxiv,
     DEFAULT_TIMEOUT,
 )
-from researchbot.config.schema import SemanticSearchConfig
+from researchbot.config.schema import MethodExtractionConfig, SemanticSearchConfig
 from researchbot.search_index import SearchIndex
+from researchbot.utils.helpers import compute_short_id, extract_json_array
 
 logger = logging.getLogger(__name__)
 
@@ -342,11 +343,6 @@ class PaperSaveTool(Tool):
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False, indent=2)
 
-    def _compute_method_id(self, paper_id: str, method_name: str) -> str:
-        """Generate a unique ID for a method."""
-        content = f"{paper_id}:{method_name}"
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-
     async def _quick_extract_methods(
         self,
         paper_id: str,
@@ -370,15 +366,9 @@ class PaperSaveTool(Tool):
         try:
             response = await self._provider.chat_with_retry(messages)
             content = response.content or "[]"
-
-            # Parse JSON array from response
-            json_start = content.find("[")
-            json_end = content.rfind("]") + 1
-            if json_start < 0 or json_end <= json_start:
+            methods = extract_json_array(content)
+            if not methods:
                 return []
-
-            json_str = content[json_start:json_end]
-            methods = json.loads(json_str)
         except Exception:
             return []
 
@@ -386,7 +376,7 @@ class PaperSaveTool(Tool):
         validated = []
         for m in methods:
             if isinstance(m, dict) and m.get("method_name"):
-                method_id = self._compute_method_id(paper_id, m["method_name"])
+                method_id = compute_short_id(f"{paper_id}:{m['method_name']}")
                 validated.append({
                     "id": method_id,
                     "paper_id": paper_id,
@@ -472,9 +462,11 @@ class PaperSaveTool(Tool):
 
         # Auto-extract methods if configured
         if search_index is not None:
-            if getattr(getattr(getattr(self, '_config', None), 'literature', None), 'method_extraction', None):
-                method_extraction_config = self._config.literature.method_extraction
-                if method_extraction_config.auto_extract:
+            config = getattr(self, '_config', None)
+            method_extraction_config: MethodExtractionConfig | None = None
+            if config is not None:
+                method_extraction_config = getattr(config.literature, 'method_extraction', None)
+            if method_extraction_config and method_extraction_config.auto_extract:
                     try:
                         title = paper_record.get("title", "")
                         abstract = paper_record.get("abstract", "")

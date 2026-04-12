@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -13,6 +12,7 @@ from researchbot.agent.tools.base import Tool
 logger = logging.getLogger(__name__)
 from researchbot.config.schema import SemanticSearchConfig
 from researchbot.search_index import SearchIndex
+from researchbot.utils.helpers import compute_short_id, extract_json_array
 
 
 # =============================================================================
@@ -75,12 +75,6 @@ Extract methods as a JSON array. Return ONLY the JSON array, no additional text.
 - Look for method names in section titles, figures, and equations
 - If no specific reusable methods are found, return: []
 - Return ONLY the JSON array, no additional text"""
-
-
-def _compute_method_id(paper_id: str, method_name: str) -> str:
-    """Generate a unique ID for a method."""
-    content = f"{paper_id}:{method_name}"
-    return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
 def _format_methods_result(methods: list[dict[str, Any]], paper_id: str) -> str:
@@ -209,17 +203,9 @@ class MethodExtractionTool(Tool):
             content = response.content or "[]"
 
             # Parse JSON array from response
-            json_start = content.find("[")
-            json_end = content.rfind("]") + 1
-            if json_start >= 0 and json_end > json_start:
-                json_str = content[json_start:json_end]
-                try:
-                    methods = json.loads(json_str)
-                except json.JSONDecodeError as e:
-                    logger.warning("Failed to parse JSON from LLM response: %s", e)
-                    return []
-            else:
-                logger.warning("No JSON array found in LLM response")
+            methods = extract_json_array(content)
+            if methods is None:
+                logger.warning("Failed to parse JSON from LLM response")
                 return []
 
             # Validate and normalize each method
@@ -292,7 +278,7 @@ class MethodExtractionTool(Tool):
                 now = datetime.now(timezone.utc).isoformat()
 
                 for m in methods:
-                    method_id = _compute_method_id(paper_id, m["method_name"])
+                    method_id = compute_short_id(f"{paper_id}:{m['method_name']}")
                     method_record = {
                         "id": method_id,
                         "paper_id": paper_id,
