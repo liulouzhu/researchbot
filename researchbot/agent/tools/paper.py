@@ -131,8 +131,9 @@ class PaperSearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, proxy: str | None = None):
+    def __init__(self, proxy: str | None = None, mailto: str | None = None):
         self.proxy = proxy
+        self._mailto = mailto
 
     async def execute(
         self,
