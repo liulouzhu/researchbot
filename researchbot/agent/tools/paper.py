@@ -219,8 +219,9 @@ class PaperSearchTool(Tool):
         }
         """
         papers: dict[str, dict] = {}
+        doi_to_arxiv_key: dict[str, str] = {}  # Track DOI -> arXiv key for merging
 
-        # 处理 arXiv 结果
+        # Process arXiv results
         for entry in arxiv_results:
             key = f"arxiv:{entry.paper_id}"
             papers[key] = {
@@ -234,14 +235,24 @@ class PaperSearchTool(Tool):
                 "sources": ["arxiv"],
                 "combined_score": 1.0,
             }
+            # Track DOI for cross-reference
+            if entry.doi:
+                doi_to_arxiv_key[entry.doi] = key
 
-        # 处理 Crossref 结果
+        # Process Crossref results
         for work in crossref_results:
             doi = work.doi
             if not doi:
                 continue
             key = f"doi:{doi}"
-            if key in papers:
+            # Check if we have an arXiv entry with this DOI
+            arxiv_key = doi_to_arxiv_key.get(doi)
+            if arxiv_key:
+                papers[arxiv_key]["citations"] = max(papers[arxiv_key]["citations"] or 0, work.cited_by_count or 0)
+                papers[arxiv_key]["sources"].append("crossref")
+                if work.journal:
+                    papers[arxiv_key]["venue"] = work.journal
+            elif key in papers:
                 papers[key]["citations"] = max(papers[key]["citations"] or 0, work.cited_by_count or 0)
                 papers[key]["sources"].append("crossref")
                 if work.journal:
@@ -259,13 +270,20 @@ class PaperSearchTool(Tool):
                     "combined_score": 1.0,
                 }
 
-        # 处理 OpenAlex 结果
+        # Process OpenAlex results
         for work in openalex_results:
             doi = work.doi
             if not doi:
                 continue
             key = f"doi:{doi}"
-            if key in papers:
+            # Check if we have an arXiv entry with this DOI
+            arxiv_key = doi_to_arxiv_key.get(doi)
+            if arxiv_key:
+                papers[arxiv_key]["citations"] = max(papers[arxiv_key]["citations"] or 0, work.cited_by_count or 0)
+                papers[arxiv_key]["sources"].append("openalex")
+                if work.journal:
+                    papers[arxiv_key]["venue"] = papers[arxiv_key]["venue"] or work.journal
+            elif key in papers:
                 papers[key]["citations"] = max(papers[key]["citations"] or 0, work.cited_by_count or 0)
                 papers[key]["sources"].append("openalex")
                 if work.journal:
@@ -283,7 +301,7 @@ class PaperSearchTool(Tool):
                     "combined_score": 1.0,
                 }
 
-        # 按综合分数排序
+        # Sort by combined score
         result = list(papers.values())
         result.sort(key=lambda x: x["combined_score"], reverse=True)
         return result
