@@ -226,6 +226,7 @@ class LiteratureConfig(Base):
     method_extraction: MethodExtractionConfig = Field(default_factory=MethodExtractionConfig)
     recommendation: RecommendationConfig = Field(default_factory=RecommendationConfig)
     gap_discovery: "GapDiscoveryConfig" = Field(default_factory=lambda: GapDiscoveryConfig())
+    survey: "LiteratureSurveyConfig" = Field(default_factory=lambda: LiteratureSurveyConfig())
 
 
 class InnovationConfig(Base):
@@ -244,6 +245,18 @@ class GapDiscoveryConfig(Base):
     )
     evidence_per_gap: int = 3  # 每个空白最少证据数
     model: str = "claude-sonnet-4-5"  # 用于空白分析的模型
+
+
+class LiteratureSurveyConfig(Base):
+    """Literature survey configuration."""
+
+    max_papers: int = 30  # 分析论文数量
+    depth: str = "standard"  # light/standard/deep
+    sources: list[str] = Field(
+        default_factory=lambda: ["arxiv", "semantic_scholar", "openalex"]
+    )
+    save_to_local: bool = True  # 自动保存高引论文到本地（top 30）
+    output_dir: str = "literature/survey"  # 输出目录
 
 
 class Config(BaseSettings):
