@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from researchbot.agent.tools.base import Tool
+
+logger = logging.getLogger(__name__)
 from researchbot.config.schema import SemanticSearchConfig
 from researchbot.search_index import SearchIndex
 
@@ -210,21 +213,29 @@ class MethodExtractionTool(Tool):
             json_end = content.rfind("]") + 1
             if json_start >= 0 and json_end > json_start:
                 json_str = content[json_start:json_end]
-                methods = json.loads(json_str)
-                # Validate and normalize each method
-                validated = []
-                for m in methods:
-                    if isinstance(m, dict) and m.get("method_name"):
-                        validated.append({
-                            "method_name": m.get("method_name", ""),
-                            "task_type": m.get("task_type", "other"),
-                            "description": m.get("description", ""),
-                            "module_interface": m.get("module_interface", ""),
-                            "dependencies": m.get("dependencies", []) if isinstance(m.get("dependencies"), list) else [],
-                        })
-                return validated
-        except Exception:
-            pass
+                try:
+                    methods = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    logger.warning("Failed to parse JSON from LLM response: %s", e)
+                    return []
+            else:
+                logger.warning("No JSON array found in LLM response")
+                return []
+
+            # Validate and normalize each method
+            validated = []
+            for m in methods:
+                if isinstance(m, dict) and m.get("method_name"):
+                    validated.append({
+                        "method_name": m.get("method_name", ""),
+                        "task_type": m.get("task_type", "other"),
+                        "description": m.get("description", ""),
+                        "module_interface": m.get("module_interface", ""),
+                        "dependencies": m.get("dependencies", []) if isinstance(m.get("dependencies"), list) else [],
+                    })
+            return validated
+        except Exception as e:
+            logger.warning("LLM method extraction failed: %s", e)
 
         return []
 
@@ -232,7 +243,6 @@ class MethodExtractionTool(Tool):
         self,
         paper_id: str,
         fulltext: str | None = None,
-        title: str | None = None,
         abstract: str | None = None,
         **kwargs: Any,
     ) -> str:
@@ -257,15 +267,17 @@ class MethodExtractionTool(Tool):
         # Get abstract and title
         if local_paper:
             abstract = abstract or local_paper.get("abstract", "")
-            title = title or local_paper.get("title", "")
+            title = local_paper.get("title", "")
         elif not abstract:
             return f"Error: Could not load paper {paper_id} locally and no abstract provided"
+        else:
+            title = ""
 
         # Extract methods via LLM
         methods = await self._extract_with_llm(
             abstract=abstract or "",
             fulltext=fulltext,
-            title=title or "",
+            title=title,
         )
 
         if not methods:
@@ -295,8 +307,8 @@ class MethodExtractionTool(Tool):
                     stored_count += 1
 
                 search_index.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to store methods in search index: %s", e)
 
         result = _format_methods_result(methods, paper_id)
         if stored_count > 0:
