@@ -15,6 +15,7 @@
 - **OpenAlex搜索** (`openalex_search`): 直接搜索 OpenAlex 数据库
 - **引文导出** (`paper_cite`): 将论文导出为 BibTeX、RIS、CSL-JSON、APA、MLA、GB/T 7714 格式
 - **方法提取** (`method_extract`/`method_search`): 从论文中提取可复用的技术方法和模块，形成可搜索的方法库；保存论文时自动提取，支持自然语言搜索和任务类型筛选
+- **论文推荐** (`paper_recommend`): 基于收藏论文或研究主题推荐相关新论文，带推荐理由
 - **创新点生成** (`innovation_workflow`): 从研究主题出发，经历候选生成 → 查新评估 → 审阅评分 → 多轮迭代收敛四个阶段；支持双模型协作，引入外部评审者打破单一模型思维盲点
 
 ### 2. 智能代理
@@ -241,6 +242,12 @@ researchbot paper compare "paper1.pdf" "paper2.pdf"
 
 # 生成文献综述
 researchbot paper review "大语言模型安全"
+
+# 基于收藏推荐
+researchbot agent -m "paper_recommend mode=\"collection\" paper_ids=[\"2301.12345\",\"2212.67890\"]"
+
+# 基于主题推荐
+researchbot agent -m "paper_recommend mode=\"topic\" topic=\"LLM\""
 ```
 
 #### 创新点工作流 (`innovation_workflow`)
