@@ -112,6 +112,18 @@ class PaperSearchTool(Tool):
                 "enum": ["ascending", "descending"],
                 "default": "descending",
             },
+            "all_sources": {
+                "type": "boolean",
+                "description": "Search across all sources (arXiv, Crossref, OpenAlex) and aggregate results",
+                "default": False,
+            },
+            "max_per_source": {
+                "type": "integer",
+                "description": "Maximum results per source when all_sources is enabled (1-50)",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 10,
+            },
         },
         "required": ["query"],
     }
@@ -126,8 +138,12 @@ class PaperSearchTool(Tool):
         start: int = 0,
         sort_by: str = "relevance",
         sort_order: str = "descending",
+        all_sources: bool = False,
+        max_per_source: int = 10,
         **kwargs: Any,
     ) -> str:
+        if all_sources:
+            return await self._search_all_sources(query, max_per_source)
         try:
             entries = await search_arxiv(
                 query=query,
