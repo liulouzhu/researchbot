@@ -5,7 +5,7 @@
 ## 核心功能
 
 ### 1. 论文智能处理
-- **论文检索** (`paper_search`): 通过学术数据库检索相关论文
+- **论文检索** (`paper_search`): 通过学术数据库检索相关论文；支持 `--all-sources` 同时搜索 arXiv、Crossref、OpenAlex，聚合去重后展示引用数、年份、venue
 - **论文摘要** (`paper_summarize`): 生成论文摘要和要点总结
 - **论文比较** (`paper_compare`): 对多篇论文进行对比分析
 - **文献综述** (`paper_review`): 基于主题生成相关工作综述
@@ -226,6 +226,9 @@ researchbot agent -m "Hello" --workspace /path/to/workspace
 ```bash
 # 搜索论文
 researchbot paper search "large language model security"
+
+# 多源聚合搜索（同时搜索 arXiv + Crossref + OpenAlex）
+researchbot agent -m "paper_search query=\"large language model security\" all_sources=true max_per_source=10"
 
 # 总结论文
 researchbot paper summarize "https://arxiv.org/abs/1234.5678"
