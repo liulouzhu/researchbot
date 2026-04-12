@@ -14,6 +14,7 @@
 - **Crossref搜索** (`crossref_search`): 直接搜索 Crossref 数据库
 - **OpenAlex搜索** (`openalex_search`): 直接搜索 OpenAlex 数据库
 - **引文导出** (`paper_cite`): 将论文导出为 BibTeX、RIS、CSL-JSON、APA、MLA、GB/T 7714 格式
+- **方法提取** (`method_extract`/`method_search`): 从论文中提取可复用的技术方法和模块，形成可搜索的方法库；保存论文时自动提取，支持自然语言搜索和任务类型筛选
 - **创新点生成** (`innovation_workflow`): 从研究主题出发，经历候选生成 → 查新评估 → 审阅评分 → 多轮迭代收敛四个阶段；支持双模型协作，引入外部评审者打破单一模型思维盲点
 
 ### 2. 智能代理
@@ -137,6 +138,10 @@ uv pip install sqlite-vec
       "embeddingApiKey": "your-api-key",
       "embeddingModel": "text-embedding-v4",
       "embeddingDimension": 1024
+    },
+    "methodExtraction": {
+      "model": "claude-sonnet-4-5",
+      "autoExtract": true
     }
   }
 }
@@ -390,6 +395,36 @@ paper_cite paper_id="2401.12345" format="bibtex" output="file" path="refs.bib"
 | `gbt7714` | GB/T 7714-2015 | 中文论文 |
 
 **Citekey 规则：** `第一作者姓 + 年份 + 标题关键词`（如 `vaswani2017attention`），DOI 后缀用于去重。
+
+#### 方法提取与搜索
+
+保存论文时自动提取可复用的技术方法和模块，形成方法库。
+
+```bash
+# 深入提取某篇论文的方法（可传入全文）
+researchbot paper extract-methods <paper_id>
+
+# 自然语言搜索方法
+researchbot paper search-methods --query "注意力机制"
+
+# 按任务类型筛选
+researchbot paper search-methods --task-type classification
+
+# 组合筛选
+researchbot paper search-methods --query "Transformer" --task-type generation
+```
+
+**配置项：**
+```json
+{
+  "literature": {
+    "methodExtraction": {
+      "model": "claude-sonnet-4-5",
+      "autoExtract": true
+    }
+  }
+}
+```
 
 #### 启动网关服务
 
