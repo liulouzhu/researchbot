@@ -101,14 +101,11 @@ class LiteratureSurveyPipeline:
             result = results[i]
             source_results[source] = [] if isinstance(result, Exception) else result
 
-        # Use PaperSearchTool._aggregate_results for DOI deduplication and merging
-        aggregated = self._search_tool._aggregate_results(
-            arxiv_results=source_results.get("arxiv", []),
-            crossref_results=[],
-            openalex_results=source_results.get("openalex", []),
-            semantic_scholar_results=source_results.get("semantic_scholar", []),
-        )
-        return aggregated
+        # Collect all results into a flat list (deduplication happens in _filter_top_papers)
+        all_papers = []
+        for source, results in source_results.items():
+            all_papers.extend(results)
+        return all_papers
 
     def _filter_top_papers(self, papers: list[dict], max_papers: int) -> list[dict]:
         """Filter top cited papers."""
@@ -123,30 +120,29 @@ class LiteratureSurveyPipeline:
         """Save papers to local database."""
         from researchbot.agent.tools.paper import PaperSaveTool
         save_tool = PaperSaveTool(workspace=self._workspace)
-        for paper in papers:
-            try:
-                await save_tool.execute(paper=paper, topic=topic)
-            except Exception as e:
-                logger.warning(f"Failed to save paper {paper.get('title', 'unknown')}: {e}")
+        await asyncio.gather(*[
+            save_tool.execute(paper=paper, topic=topic)
+            for paper in papers
+        ], return_exceptions=True)
 
     async def _extract_methods(self, papers: list[dict]) -> list[dict]:
         """Extract methods from papers."""
         from researchbot.agent.tools.method_extraction import MethodExtractionTool
         method_tool = MethodExtractionTool(workspace=self._workspace)
-        results = []
-        for paper in papers:
+
+        async def extract_one(paper):
             try:
                 paper_id = paper.get("arxiv_id") or paper.get("paper_id")
                 abstract = paper.get("abstract", "")
-                result = await method_tool.execute(
-                    paper_id=paper_id,
-                    abstract=abstract,
-                )
+                result = await method_tool.execute(paper_id=paper_id, abstract=abstract)
                 if result and "Error" not in result:
-                    results.append({"paper": paper, "methods": result})
-            except Exception as e:
-                logger.warning(f"Failed to extract methods from {paper.get('title', 'unknown')}: {e}")
-        return results
+                    return {"paper": paper, "methods": result}
+            except Exception:
+                pass
+            return None
+
+        results = await asyncio.gather(*[extract_one(p) for p in papers], return_exceptions=True)
+        return [r for r in results if r is not None and not isinstance(r, Exception)]
 
     async def _analyze_gaps(self, topic: str) -> str:
         """Analyze research gaps and return markdown report."""
