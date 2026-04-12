@@ -291,6 +291,7 @@ class AgentLoop:
             KnowledgeGraphRebuildTool,
         )
         from researchbot.agent.tools.paper_cite import PaperCiteTool
+        from researchbot.agent.tools.paper_recommend import PaperRecommendTool
         from researchbot.agent.tools.innovation import InnovationWorkflowTool
         semantic_config = getattr(self.literature_config, "semantic_search", None) if self.literature_config else None
 
@@ -313,6 +314,11 @@ class AgentLoop:
         self.tools.register(PaperCompareTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(PaperReviewTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(InnovationWorkflowTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, innovation_config=self.innovation_config, config=self._config, proxy=self.web_proxy))
+        self.tools.register(PaperRecommendTool(
+            workspace=str(self.workspace),
+            semantic_config=semantic_config,
+            recommendation_config=getattr(self.literature_config, "recommendation", None) if self.literature_config else None,
+        ))
 
         # Register Crossref/OpenAlex enrichment tools
         self.tools.register(CrossrefSearchTool(mailto=crossref_mailto, user_agent=crossref_ua, proxy=self.web_proxy))
