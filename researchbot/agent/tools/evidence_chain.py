@@ -3,24 +3,49 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from pathlib import Path
 
 from researchbot.agent.tools.gap import Evidence
+from researchbot.agent.tools.openalex_client import search_openalex
+from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar
+from researchbot.config.schema import SemanticSearchConfig
+from researchbot.search_index import SearchIndex
+
+logger = logging.getLogger(__name__)
 
 
 class EvidenceChain:
     """Extract evidence chains from papers."""
 
     def __init__(self, workspace: str | None = None):
-        self._workspace = workspace
+        self._workspace = Path(workspace) if workspace else None
+        self._index: SearchIndex | None = None
+        self._initialized = False
+        self._lock = asyncio.Lock()
+
+    async def _ensure_initialized(self) -> None:
+        """Ensure index is initialized."""
+        if not self._initialized:
+            async with self._lock:
+                if not self._initialized:
+                    index = self._get_index()
+                    await index.initialize()
+                    self._initialized = True
+
+    def _get_index(self) -> SearchIndex:
+        """Get or create the search index."""
+        if self._index is None:
+            db_path = self._resolve_path(SemanticSearchConfig().sqlite_db_path)
+            self._index = SearchIndex(db_path, SemanticSearchConfig())
+        return self._index
 
     async def extract_from_papers(self, paper_ids: list[str]) -> list[Evidence]:
         """Extract evidence from a list of papers."""
-        from researchbot.search_index import SearchIndex
-        from researchbot.config.schema import SemanticSearchConfig
+        await self._ensure_initialized()
+        index = self._get_index()
 
         evidence = []
-        db_path = self._resolve_path(SemanticSearchConfig().sqlite_db_path)
-        index = SearchIndex(db_path, SemanticSearchConfig())
 
         for paper_id in paper_ids:
             paper = index.get_paper(paper_id)
@@ -52,9 +77,6 @@ class EvidenceChain:
 
     async def extract_from_topic(self, topic: str, max_papers: int = 20) -> list[Evidence]:
         """Extract evidence from papers related to a topic."""
-        from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar
-        from researchbot.agent.tools.openalex_client import search_openalex
-
         evidence = []
         tasks = []
 
@@ -70,9 +92,6 @@ class EvidenceChain:
 
     async def _search_and_extract(self, source: str, topic: str, max_papers: int) -> list[Evidence]:
         """Search one source and extract evidence."""
-        from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar
-        from researchbot.agent.tools.openalex_client import search_openalex
-
         try:
             if source == "semantic_scholar":
                 papers = await search_semantic_scholar(query=topic, max_results=max_papers)
@@ -95,7 +114,8 @@ class EvidenceChain:
                         )
                     )
             return evidence
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Error searching {source} for topic '{topic}': {e}")
             return []
 
     def _extract_gap_indicators(self, text: str) -> list[str]:
@@ -120,9 +140,9 @@ class EvidenceChain:
         ]
         return [ind for ind in indicators if ind.lower() in text.lower()]
 
-    def _resolve_path(self, relative_path: str) -> str:
+    def _resolve_path(self, relative_path: str) -> Path:
         """Resolve path relative to workspace."""
-        if self._workspace:
-            from pathlib import Path
-            return str(Path(self._workspace) / relative_path)
-        return relative_path
+        p = Path(relative_path)
+        if not p.is_absolute() and self._workspace:
+            p = self._workspace / p
+        return p
