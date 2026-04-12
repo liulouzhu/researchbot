@@ -72,7 +72,6 @@ class EvidenceChain:
                     )
                 )
 
-        index.close()
         return evidence
 
     async def extract_from_topic(self, topic: str, max_papers: int = 20) -> list[Evidence]:
