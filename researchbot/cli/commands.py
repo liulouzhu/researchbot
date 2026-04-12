@@ -1290,6 +1290,68 @@ def rebuild_graph(
 
 
 # ============================================================================
+# Paper Methods
+# ============================================================================
+
+paper_app = typer.Typer(help="Manage paper methods")
+app.add_typer(paper_app, name="paper")
+
+
+@paper_app.command("extract-methods")
+def extract_methods(
+    paper_id: str = typer.Argument(..., help="Paper ID to extract methods from"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace path"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Extract reusable methods/modules from a paper."""
+    import asyncio
+
+    from researchbot.agent.tools.method_extraction import MethodExtractionTool
+
+    runtime_config = _load_runtime_config(config, workspace)
+    provider = _make_provider(runtime_config)
+    ws = Path(workspace) if workspace else runtime_config.workspace_path
+
+    tool = MethodExtractionTool(
+        provider=provider,
+        workspace=str(ws),
+        semantic_config=runtime_config.literature.semantic_search,
+    )
+
+    result = asyncio.run(tool.execute(paper_id=paper_id))
+    console.print(result)
+
+
+@paper_app.command("search-methods")
+def search_methods(
+    query: str | None = typer.Option(None, "--query", "-q", help="Search query"),
+    task_type: str | None = typer.Option(None, "--task-type", "-t", help="Filter by task type"),
+    top_k: int = typer.Option(10, "--top-k", "-k", help="Number of results"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace path"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Search the methods library."""
+    import asyncio
+
+    from researchbot.agent.tools.method_extraction import MethodSearchTool
+
+    runtime_config = _load_runtime_config(config, workspace)
+    ws = Path(workspace) if workspace else runtime_config.workspace_path
+
+    tool = MethodSearchTool(
+        workspace=str(ws),
+        semantic_config=runtime_config.literature.semantic_search,
+    )
+
+    result = asyncio.run(tool.execute(
+        query=query,
+        task_type=task_type,
+        top_k=top_k,
+    ))
+    console.print(result)
+
+
+# ============================================================================
 # OAuth Login
 # ============================================================================
 
