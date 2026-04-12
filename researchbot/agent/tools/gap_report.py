@@ -9,6 +9,18 @@ from researchbot.agent.tools.gap import ResearchGap
 class GapReport:
     """Generate interactive reports from research gaps."""
 
+    MAX_ITEMS = 5
+
+    GAP_TYPE_DISPLAY = {
+        "methodological": "方法空白",
+        "application": "应用空白",
+        "evaluation": "评估空白",
+    }
+
+    MODE_DISPLAY = {
+        "collection": "基于收藏论文",
+    }
+
     def __init__(self, gaps: list[ResearchGap], topic: str, mode: str):
         self.gaps = gaps
         self.topic = topic
@@ -19,17 +31,13 @@ class GapReport:
         lines = [
             f"# 研究空白发现报告\n",
             f"**主题：** {self.topic}",
-            f"**分析模式：** {'基于收藏论文' if self.mode == 'collection' else '基于研究主题'}",
+            f"**分析模式：** {self.MODE_DISPLAY.get(self.mode, '基于研究主题')}",
             f"**发现空白数：** {len(self.gaps)}\n",
             "---",
         ]
 
         for i, gap in enumerate(self.gaps, 1):
-            gap_type_display = {
-                "methodological": "方法空白",
-                "application": "应用空白",
-                "evaluation": "评估空白",
-            }.get(gap.gap_type, gap.gap_type)
+            gap_type_display = self.GAP_TYPE_DISPLAY.get(gap.gap_type, gap.gap_type)
 
             lines.append(f"\n## {i}. {gap.title}")
             lines.append(f"\n**类型：** {gap_type_display}")
@@ -95,7 +103,7 @@ class GapReport:
 
         if all_directions:
             return {
-                "answer": "具体机会点包括：\n" + "\n".join(f"- {d}" for d in all_directions[:5]),
+                "answer": "具体机会点包括：\n" + "\n".join(f"- {d}" for d in all_directions[: self.MAX_ITEMS]),
                 "follow_ups": ["推荐哪些论文作为入门？", "这个方向目前的SOTA是什么？"],
             }
         return {
@@ -105,27 +113,44 @@ class GapReport:
 
     def _answer_papers(self) -> dict:
         """Recommend introductory papers."""
+        seen = set()
         papers = []
         for gap in self.gaps:
             for e in gap.evidence:
-                papers.append(f"- **{e.source}** (ID: {e.source_id})")
+                if e.source_id not in seen:
+                    seen.add(e.source_id)
+                    papers.append(f"- **{e.source}** (ID: {e.source_id})")
 
         if papers:
             return {
-                "answer": "推荐以下论文作为入门：\n" + "\n".join(papers[:5]),
+                "answer": "推荐以下论文作为入门：\n" + "\n".join(papers[: self.MAX_ITEMS]),
                 "follow_ups": ["这些论文的核心贡献是什么？", "还有其他相关论文吗？"],
             }
         return {"answer": "当前报告证据不足，无法推荐论文。", "follow_ups": []}
 
     def _answer_solutions(self) -> dict:
         """Answer about existing solutions."""
+        if not self.gaps:
+            return {
+                "answer": "当前报告没有研究空白数据，无法提供解决方法建议。",
+                "follow_ups": [],
+            }
+
+        directions = []
+        for gap in self.gaps:
+            if gap.potential_directions:
+                directions.extend(gap.potential_directions)
+
+        if directions:
+            return {
+                "answer": "根据研究空白，建议的潜在研究方向包括：\n"
+                         + "\n".join(f"- {d}" for d in directions[: self.MAX_ITEMS]),
+                "follow_ups": ["有没有初步的探索性工作？", "这个方向的风险在哪里？"],
+            }
         return {
             "answer": "研究空白意味着目前没有成熟的解决方法。"
-                     "潜在方向包括：\n"
-                     "- 全新方法设计\n"
-                     "- 现有方法改进\n"
-                     "- 跨领域方法迁移",
-            "follow_ups": ["有没有初步的探索性工作？", "这个方向的风险在哪里？"],
+                     "建议使用 innovation_workflow 进行深度分析。",
+            "follow_ups": [],
         }
 
     def _answer_why_high_priority(self) -> dict:
