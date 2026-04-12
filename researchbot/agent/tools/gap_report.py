@@ -19,6 +19,7 @@ class GapReport:
 
     MODE_DISPLAY = {
         "collection": "基于收藏论文",
+        "topic": "基于研究主题",
     }
 
     def __init__(self, gaps: list[ResearchGap], topic: str, mode: str):
