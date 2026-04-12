@@ -216,17 +216,6 @@ class MethodExtractionConfig(Base):
     auto_extract: bool = True  # 自动从保存的论文提取方法
 
 
-class GapDiscoveryConfig(Base):
-    """Research gap discovery configuration."""
-
-    max_results: int = 10  # 最大空白数量
-    gap_types: list[str] = Field(
-        default_factory=lambda: ["methodological", "application", "evaluation"]
-    )
-    evidence_per_gap: int = 3  # 每个空白最少证据数
-    model: str = "claude-sonnet-4-5"  # 用于空白分析的模型
-
-
 class LiteratureConfig(Base):
     """Literature/paper tools configuration."""
 
@@ -236,7 +225,7 @@ class LiteratureConfig(Base):
     semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
     method_extraction: MethodExtractionConfig = Field(default_factory=MethodExtractionConfig)
     recommendation: RecommendationConfig = Field(default_factory=RecommendationConfig)
-    gap_discovery: GapDiscoveryConfig = Field(default_factory=GapDiscoveryConfig)
+    gap_discovery: "GapDiscoveryConfig" = Field(default_factory=lambda: GapDiscoveryConfig())
 
 
 class InnovationConfig(Base):
@@ -244,6 +233,17 @@ class InnovationConfig(Base):
 
     reviewer_model: str | None = None  # Default external reviewer model for dual-model mode
     provider: str | None = None  # Default provider for the reviewer model (e.g. "openai", "anthropic", "auto")
+
+
+class GapDiscoveryConfig(Base):
+    """Research gap discovery configuration."""
+
+    max_results: int = 10  # 最大空白数量
+    gap_types: list[str] = Field(
+        default_factory=lambda: ["methodological", "application", "evaluation"]
+    )
+    evidence_per_gap: int = 3  # 每个空白最少证据数
+    model: str = "claude-sonnet-4-5"  # 用于空白分析的模型
 
 
 class Config(BaseSettings):
