@@ -287,6 +287,40 @@ class PaperSearchTool(Tool):
         result.sort(key=lambda x: x["combined_score"], reverse=True)
         return result
 
+    def _format_aggregated_results(self, aggregated: list[dict], query: str) -> str:
+        """Format aggregated results for display."""
+        if not aggregated:
+            return f"No results found for: {query}"
+
+        lines = [f"Search results for: {query}\n"]
+        lines.append(f"Found {len(aggregated)} unique papers across sources\n")
+
+        for i, paper in enumerate(aggregated[:20], 1):  # 最多显示20条
+            lines.append(f"[{i}] {paper['title']}")
+            authors_str = ", ".join(paper["authors"][:3])
+            if len(paper["authors"]) > 3:
+                authors_str += " et al."
+            year_str = str(paper["year"]) if paper["year"] else "N/A"
+            venue_str = paper["venue"] or ("arXiv" if "arxiv" in paper["sources"] else "N/A")
+            lines.append(f"    {authors_str} | {year_str} | {venue_str}")
+
+            # 引用数和来源
+            citation_parts = []
+            if paper["citations"]:
+                citation_parts.append(f"Citations: {paper['citations']}")
+            arxiv_id = paper.get("arxiv_id")
+            if arxiv_id:
+                citation_parts.append(f"arXiv: {arxiv_id}")
+            if citation_parts:
+                lines.append(f"    {' | '.join(citation_parts)}")
+
+            # 来源标记
+            sources_str = ", ".join(paper["sources"])
+            lines.append(f"    Sources: {sources_str}")
+            lines.append("")
+
+        return "\n".join(lines)
+
 
 def paper_to_dict(entry: PaperEntry) -> dict[str, Any]:
     """Convert PaperEntry to full standardized dict for paper_get output."""
