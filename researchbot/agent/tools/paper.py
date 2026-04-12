@@ -462,7 +462,6 @@ class PaperSaveTool(Tool):
             try:
                 await search_index.initialize()
                 sync_result = await search_index.upsert_paper(paper_record)
-                search_index.close()
                 index_status = f"ok (content_changed={sync_result['content_changed']})"
                 if sync_result["graph_sync_status"] == "failed":
                     index_status = f"graph sync failed: {sync_result['graph_sync_error']}"
@@ -486,6 +485,10 @@ class PaperSaveTool(Tool):
                             logger.info(f"Extracted {len(methods)} methods from {paper_id}")
                     except Exception as e:
                         logger.warning(f"Failed to extract methods for {paper_id}: {e}")
+
+        # Close search index after all operations
+        if search_index is not None:
+            search_index.close()
 
         return (
             f"Saved paper: {paper_id}\n"
