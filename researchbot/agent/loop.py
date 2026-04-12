@@ -294,6 +294,7 @@ class AgentLoop:
         from researchbot.agent.tools.paper_recommend import PaperRecommendTool
         from researchbot.agent.tools.innovation import InnovationWorkflowTool
         from researchbot.agent.tools.research_gap_discovery import ResearchGapDiscoveryTool
+        from researchbot.agent.tools.literature_survey import LiteratureSurveyTool
         semantic_config = getattr(self.literature_config, "semantic_search", None) if self.literature_config else None
 
         # Crossref/OpenAlex config for enrichment tools
@@ -363,6 +364,13 @@ class AgentLoop:
 
         # Register citation export tool
         self.tools.register(PaperCiteTool(workspace=str(self.workspace)))
+
+        # Register literature survey tool
+        survey_config = getattr(self.literature_config, "survey", None) if self.literature_config else None
+        self.tools.register(LiteratureSurveyTool(
+            workspace=str(self.workspace),
+            config=survey_config,
+        ))
 
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -459,6 +467,13 @@ class AgentLoop:
         )
         if any(term in corpus for term in innovation_terms):
             return ["innovation"]
+
+        survey_terms = (
+            "调研", "文献调研", "literature survey", "survey",
+            "研究综述", "领域调研", "survey paper", "做调研",
+        )
+        if any(term in corpus for term in survey_terms):
+            return ["literature_survey"]
         return []
 
     @staticmethod
