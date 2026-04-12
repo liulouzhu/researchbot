@@ -1391,6 +1391,7 @@ def gap_discovery(
     paper_ids: str = typer.Option(None, help="Comma-separated paper IDs for collection mode"),
     topic: str = typer.Option(None, help="Research topic for topic mode"),
     max_results: int = typer.Option(10, help="Maximum number of gaps to report"),
+    gap_types: str = typer.Option(None, help="Comma-separated gap types: methodological,application,evaluation"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace path"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
 ):
@@ -1408,12 +1409,14 @@ def gap_discovery(
     )
 
     paper_ids_list = [p.strip() for p in paper_ids.split(",")] if paper_ids else None
+    gap_types_list = [g.strip() for g in gap_types.split(",")] if gap_types else None
 
     result = asyncio.run(tool.execute(
         mode=mode,
         paper_ids=paper_ids_list,
         topic=topic,
         max_results=max_results,
+        gap_types=gap_types_list,
     ))
     typer.echo(result)
 
