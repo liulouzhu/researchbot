@@ -8,9 +8,8 @@ from pathlib import Path
 
 from researchbot.agent.tools.arxiv_client import PaperEntry as ArxivPaper, search_arxiv
 from researchbot.agent.tools.gap import Evidence
-from researchbot.agent.tools.openalex_client import search_openalex
-from researchbot.agent.tools.semantic_scholar_client import SemanticScholarWork
-from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar
+from researchbot.agent.tools.openalex_client import OpenAlexWork, search_openalex
+from researchbot.agent.tools.semantic_scholar_client import SemanticScholarWork, search_semantic_scholar
 from researchbot.config.schema import SemanticSearchConfig
 from researchbot.search_index import SearchIndex
 
@@ -106,8 +105,11 @@ class EvidenceChain:
 
             evidence = []
             for paper in papers:
-                # arXiv uses "summary" instead of "abstract"
-                if isinstance(paper, ArxivPaper):
+                if isinstance(paper, OpenAlexWork):
+                    title = paper.title
+                    abstract = paper.abstract
+                    paper_id = paper.id
+                elif isinstance(paper, ArxivPaper):
                     title = paper.title
                     abstract = paper.summary
                     paper_id = paper.paper_id
@@ -116,9 +118,9 @@ class EvidenceChain:
                     abstract = getattr(paper, "abstract", "")
                     paper_id = paper.paper_id
                 else:
-                    title = paper.get("title", "")
-                    abstract = paper.get("abstract", "")
-                    paper_id = paper.get("paper_id") or paper.get("id", "")
+                    title = getattr(paper, "title", "") or ""
+                    abstract = getattr(paper, "abstract", "") or getattr(paper, "summary", "") or ""
+                    paper_id = getattr(paper, "paper_id", "") or getattr(paper, "id", "") or ""
 
                 text = f"{title} {abstract}"
                 indicators = self._extract_gap_indicators(text)
