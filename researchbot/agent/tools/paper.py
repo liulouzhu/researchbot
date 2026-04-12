@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -18,6 +19,8 @@ from researchbot.agent.tools.arxiv_client import (
     search_arxiv,
     DEFAULT_TIMEOUT,
 )
+from researchbot.agent.tools.crossref_client import search_crossref
+from researchbot.agent.tools.openalex_client import search_openalex
 from researchbot.config.schema import MethodExtractionConfig, SemanticSearchConfig
 from researchbot.search_index import SearchIndex
 from researchbot.utils.helpers import compute_short_id, extract_json_array
@@ -157,6 +160,41 @@ class PaperSearchTool(Tool):
             return _format_results(entries, query)
         except Exception as e:
             return f"Error: {e}"
+
+    async def _search_all_sources(self, query: str, max_per_source: int) -> str:
+        """Search across all sources and aggregate results."""
+        # 并行发起三个搜索
+        arxiv_task = search_arxiv(
+            query=query,
+            max_results=max_per_source,
+            timeout=DEFAULT_TIMEOUT,
+            proxy=self.proxy,
+        )
+        crossref_task = search_crossref(
+            query=query,
+            max_results=max_per_source,
+            mailto=getattr(self, '_mailto', None),
+        )
+        openalex_task = search_openalex(
+            query=query,
+            max_results=max_per_source,
+        )
+
+        # 等待所有搜索完成，捕获异常
+        results = await asyncio.gather(
+            arxiv_task, crossref_task, openalex_task,
+            return_exceptions=True
+        )
+
+        arxiv_results = results[0] if not isinstance(results[0], Exception) else []
+        crossref_results = results[1] if not isinstance(results[1], Exception) else []
+        openalex_results = results[2] if not isinstance(results[2], Exception) else []
+
+        # 聚合结果
+        aggregated = self._aggregate_results(arxiv_results, crossref_results, openalex_results)
+
+        # 格式化输出
+        return self._format_aggregated_results(aggregated, query)
 
 
 def paper_to_dict(entry: PaperEntry) -> dict[str, Any]:
