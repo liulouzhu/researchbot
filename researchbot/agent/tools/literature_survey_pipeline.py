@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from researchbot.agent.tools.gap import ResearchGap
 from researchbot.agent.tools.paper import PaperSearchTool
 from researchbot.agent.tools.arxiv_client import search_arxiv
 from researchbot.agent.tools.openalex_client import search_openalex
@@ -34,15 +33,26 @@ class LiteratureSurveyPipeline:
         self,
         topic: str,
         depth: str = "standard",
-        max_papers: int = 30,
+        max_papers: int | None = None,
         save_to_local: bool = True,
     ) -> tuple[str, str]:
         """
         Execute literature survey pipeline.
 
+        Args:
+            topic: Research topic
+            depth: Survey depth (light=10, standard=30, deep=50 papers)
+            max_papers: Override max papers (if provided, takes precedence over depth)
+            save_to_local: Whether to save papers locally
+
         Returns:
             tuple: (markdown_report, topic_slug)
         """
+        # Map depth to max_papers if not explicitly provided
+        if max_papers is None:
+            depth_map = {"light": 10, "standard": 30, "deep": 50}
+            max_papers = depth_map.get(depth, 30)
+
         # 1. 搜索
         search_results = await self._search_papers(topic)
         # 2. 筛选高引
@@ -118,19 +128,19 @@ class LiteratureSurveyPipeline:
                 logger.warning(f"Failed to extract methods from {paper.get('title', 'unknown')}: {e}")
         return results
 
-    async def _analyze_gaps(self, topic: str) -> list[ResearchGap]:
-        """Analyze research gaps."""
+    async def _analyze_gaps(self, topic: str) -> str:
+        """Analyze research gaps and return markdown report."""
         from researchbot.agent.tools.research_gap_discovery import ResearchGapDiscoveryTool
         gap_tool = ResearchGapDiscoveryTool(workspace=self._workspace)
         result = await gap_tool.execute(mode="topic", topic=topic, max_results=10)
-        return []  # GapReport 直接生成报告，这里返回空
+        return result
 
     def _generate_report(
         self,
         topic: str,
         papers: list[dict],
         methods: list[dict],
-        gaps: list[ResearchGap],
+        gaps: str,
     ) -> str:
         """Generate markdown report."""
         lines = [
@@ -138,6 +148,7 @@ class LiteratureSurveyPipeline:
             f"**调研时间**: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n",
             f"**数据来源**: arXiv, Semantic Scholar, OpenAlex\n",
             f"**分析论文数**: {len(papers)} 篇\n",
+            f"**方法提取数**: {len(methods)} 篇\n",
             "---\n",
         ]
 
@@ -149,6 +160,24 @@ class LiteratureSurveyPipeline:
             if isinstance(authors, list) and authors:
                 lines.append(f"   - 作者: {', '.join(authors[:3])}{' et al.' if len(authors) > 3 else ''}")
             lines.append(f"   - 年份: {p.get('year', 'N/A')} | 引用数: {p.get('citations', 0) or 0}\n")
+
+        # 方法总结
+        lines.append("\n## 3. 方法总结\n")
+        if methods:
+            lines.append(f"从 {len(methods)} 篇论文中提取了方法信息：\n")
+            for m in methods[:10]:
+                paper_title = m.get("paper", {}).get("title", "Unknown")
+                method_text = m.get("methods", "")
+                lines.append(f"### {paper_title}\n{method_text}\n")
+        else:
+            lines.append("未提取到方法信息。\n")
+
+        # 研究空白分析
+        lines.append("\n## 4. 研究空白分析\n")
+        if gaps:
+            lines.append(gaps)
+        else:
+            lines.append("未进行空白分析。\n")
 
         return "\n".join(lines)
 
