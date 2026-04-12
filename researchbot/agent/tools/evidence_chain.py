@@ -6,8 +6,10 @@ import asyncio
 import logging
 from pathlib import Path
 
+from researchbot.agent.tools.arxiv_client import PaperEntry as ArxivPaper, search_arxiv
 from researchbot.agent.tools.gap import Evidence
 from researchbot.agent.tools.openalex_client import search_openalex
+from researchbot.agent.tools.semantic_scholar_client import SemanticScholarWork
 from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar
 from researchbot.config.schema import SemanticSearchConfig
 from researchbot.search_index import SearchIndex
@@ -81,6 +83,7 @@ class EvidenceChain:
 
         tasks.append(self._search_and_extract("semantic_scholar", topic, max_papers))
         tasks.append(self._search_and_extract("openalex", topic, max_papers))
+        tasks.append(self._search_and_extract("arxiv", topic, max_papers))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
@@ -96,18 +99,34 @@ class EvidenceChain:
                 papers = await search_semantic_scholar(query=topic, max_results=max_papers)
             elif source == "openalex":
                 papers = await search_openalex(query=topic, max_results=max_papers)
+            elif source == "arxiv":
+                papers = await search_arxiv(query=topic, max_results=max_papers)
             else:
                 return []
 
             evidence = []
             for paper in papers:
-                text = f"{paper.get('title', '')} {paper.get('abstract', '')}"
+                # arXiv uses "summary" instead of "abstract"
+                if isinstance(paper, ArxivPaper):
+                    title = paper.title
+                    abstract = paper.summary
+                    paper_id = paper.paper_id
+                elif isinstance(paper, SemanticScholarWork):
+                    title = paper.title
+                    abstract = getattr(paper, "abstract", "")
+                    paper_id = paper.paper_id
+                else:
+                    title = paper.get("title", "")
+                    abstract = paper.get("abstract", "")
+                    paper_id = paper.get("paper_id") or paper.get("id", "")
+
+                text = f"{title} {abstract}"
                 indicators = self._extract_gap_indicators(text)
                 if indicators:
                     evidence.append(
                         Evidence(
-                            source=paper.get("title", "Unknown"),
-                            source_id=paper.get("paper_id") or paper.get("id", ""),
+                            source=title or "Unknown",
+                            source_id=paper_id,
                             quote=f"检测到指示词: {', '.join(indicators)}",
                             context=f"从 {source} 搜索结果提取",
                         )
