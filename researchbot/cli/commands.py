@@ -1385,6 +1385,39 @@ def recommend(
     console.print(result)
 
 
+@paper_app.command("gap-discovery")
+def gap_discovery(
+    mode: str = typer.Option(..., help="Analysis mode: collection or topic"),
+    paper_ids: str = typer.Option(None, help="Comma-separated paper IDs for collection mode"),
+    topic: str = typer.Option(None, help="Research topic for topic mode"),
+    max_results: int = typer.Option(10, help="Maximum number of gaps to report"),
+    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace path"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
+):
+    """Discover research gaps from papers or topics."""
+    import asyncio
+
+    from researchbot.agent.tools.research_gap_discovery import ResearchGapDiscoveryTool
+
+    runtime_config = _load_runtime_config(config, workspace)
+    ws = Path(workspace) if workspace else runtime_config.workspace_path
+
+    tool = ResearchGapDiscoveryTool(
+        workspace=str(ws),
+        config=runtime_config.literature.gap_discovery,
+    )
+
+    paper_ids_list = [p.strip() for p in paper_ids.split(",")] if paper_ids else None
+
+    result = asyncio.run(tool.execute(
+        mode=mode,
+        paper_ids=paper_ids_list,
+        topic=topic,
+        max_results=max_results,
+    ))
+    typer.echo(result)
+
+
 # ============================================================================
 # OAuth Login
 # ============================================================================
