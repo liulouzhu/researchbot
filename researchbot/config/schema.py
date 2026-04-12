@@ -180,6 +180,14 @@ class SemanticScholarConfig(Base):
     api_base: str = "https://api.semanticscholar.org/graph/v1"  # API base URL
 
 
+class RecommendationConfig(Base):
+    """Paper recommendation configuration."""
+
+    max_results: int = 10
+    exclude_collected: bool = True
+    external_sources: list[str] = Field(default_factory=lambda: ["semantic_scholar", "openalex"])
+
+
 class SemanticSearchConfig(Base):
     """Local semantic search configuration using SQLite."""
 
@@ -216,6 +224,7 @@ class LiteratureConfig(Base):
     semantic_scholar: SemanticScholarConfig = Field(default_factory=SemanticScholarConfig)
     semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
     method_extraction: MethodExtractionConfig = Field(default_factory=MethodExtractionConfig)
+    recommendation: RecommendationConfig = Field(default_factory=RecommendationConfig)
 
 
 class InnovationConfig(Base):
