@@ -252,10 +252,10 @@ researchbot agent -m "paper_recommend mode=\"collection\" paper_ids=[\"2301.1234
 researchbot agent -m "paper_recommend mode=\"topic\" topic=\"LLM\""
 
 # CLI 使用
-researchbot paper survey "LLM security"
+researchbot survey "LLM security"
 
 # 指定参数
-researchbot paper survey "LLM security" --depth=standard --max-papers=30
+researchbot survey "LLM security" --depth=standard --max-papers=30
 
 # Agent 对话
 researchbot agent -m "调研 LLM security 相关研究"

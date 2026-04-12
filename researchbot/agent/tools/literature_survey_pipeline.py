@@ -54,7 +54,7 @@ class LiteratureSurveyPipeline:
             max_papers = depth_map.get(depth, 30)
 
         # 1. 搜索
-        search_results = await self._search_papers(topic)
+        search_results = await self._search_papers(topic, max_papers)
         # 2. 筛选高引
         top_papers = self._filter_top_papers(search_results, max_papers)
         # 3. 保存到本地（可选）
@@ -70,23 +70,43 @@ class LiteratureSurveyPipeline:
         topic_slug = self._save_report(report, topic)
         return (report, topic_slug)
 
-    async def _search_papers(self, topic: str) -> list[dict[str, Any]]:
-        """Search papers from all configured sources."""
-        # 直接调用搜索客户端（避免通过 Tool 返回字符串）
-        arxiv_task = search_arxiv(query=topic, max_results=20)
-        openalex_task = search_openalex(query=topic, max_results=20)
-        semantic_scholar_task = search_semantic_scholar(query=topic, max_results=20)
+    async def _search_papers(self, topic: str, max_papers: int) -> list[dict[str, Any]]:
+        """Search papers from configured sources.
 
-        arxiv_results, openalex_results, semantic_scholar_results = await asyncio.gather(
-            arxiv_task, openalex_task, semantic_scholar_task, return_exceptions=True
-        )
+        Args:
+            topic: Research topic
+            max_papers: Target number of papers (used to size per-source max_results)
+        """
+        # Determine which sources to search based on config
+        enabled_sources = set(self._config.sources)
 
-        # 使用 PaperSearchTool._aggregate_results 做 DOI 去重和合并
+        # Calculate per-source max_results to ensure we get enough before filtering
+        max_results_per_source = max(20, max_papers * 2)
+
+        # Build search tasks only for enabled sources
+        tasks = {}
+        if "arxiv" in enabled_sources:
+            tasks["arxiv"] = search_arxiv(query=topic, max_results=max_results_per_source)
+        if "openalex" in enabled_sources:
+            tasks["openalex"] = search_openalex(query=topic, max_results=max_results_per_source)
+        if "semantic_scholar" in enabled_sources:
+            tasks["semantic_scholar"] = search_semantic_scholar(query=topic, max_results=max_results_per_source)
+
+        # Execute all enabled searches in parallel
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        # Map results back to source names (preserving order from config)
+        source_results = {}
+        for i, source in enumerate(tasks.keys()):
+            result = results[i]
+            source_results[source] = [] if isinstance(result, Exception) else result
+
+        # Use PaperSearchTool._aggregate_results for DOI deduplication and merging
         aggregated = self._search_tool._aggregate_results(
-            arxiv_results=[r for r in [arxiv_results] if not isinstance(r, Exception)],
+            arxiv_results=source_results.get("arxiv", []),
             crossref_results=[],
-            openalex_results=[r for r in [openalex_results] if not isinstance(r, Exception)],
-            semantic_scholar_results=[r for r in [semantic_scholar_results] if not isinstance(r, Exception)],
+            openalex_results=source_results.get("openalex", []),
+            semantic_scholar_results=source_results.get("semantic_scholar", []),
         )
         return aggregated
 
