@@ -1290,6 +1290,42 @@ def rebuild_graph(
 
 
 # ============================================================================
+# Survey Command
+# ============================================================================
+
+
+@app.command()
+def survey(
+    topic: str = typer.Argument(..., help="Research topic to survey"),
+    depth: str = typer.Option("standard", help="Survey depth: light, standard, deep"),
+    max_papers: int = typer.Option(30, help="Maximum number of papers to analyze"),
+    save: bool = typer.Option(True, help="Save top papers to local database"),
+    workspace: str = typer.Option(None, help="Workspace path"),
+):
+    """Conduct a comprehensive literature survey on a research topic."""
+    import asyncio
+    from researchbot.config import load_config
+    from researchbot.agent.tools.literature_survey import LiteratureSurveyTool
+    from researchbot.config.schema import LiteratureSurveyConfig
+
+    config = load_config(workspace)
+    survey_config = getattr(config.literature, "survey", None)
+
+    tool = LiteratureSurveyTool(
+        workspace=workspace,
+        config=survey_config,
+    )
+
+    result = asyncio.run(tool.execute(
+        topic=topic,
+        depth=depth,
+        max_papers=max_papers,
+        save_to_local=save,
+    ))
+    typer.echo(result)
+
+
+# ============================================================================
 # Paper Methods
 # ============================================================================
 
