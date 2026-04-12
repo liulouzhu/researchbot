@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -256,6 +257,19 @@ class PaperGetTool(Tool):
             return f"Error: {e}"
 
 
+QUICK_EXTRACT_METHODS_PROMPT = """从论文标题和摘要中提取可复用的技术方法和模块。
+
+返回 JSON 数组，每个方法包含：
+- method_name: 方法名称
+- task_type: 任务类型 (classification/detection/generation/embedding/...)
+- description: 一句话描述
+
+标题: {title}
+摘要: {abstract}
+
+只返回 JSON 数组，不要其他文字。"""
+
+
 class PaperSaveTool(Tool):
     """Save a paper to local literature knowledge base."""
 
@@ -286,10 +300,14 @@ class PaperSaveTool(Tool):
         self,
         workspace: str | None = None,
         semantic_config: SemanticSearchConfig | None = None,
+        config: Any = None,
+        provider: Any = None,
     ):
         self._workspace = Path(workspace) if workspace else None
         self._semantic_config = semantic_config
         self._search_index: SearchIndex | None = None
+        self._config = config
+        self._provider = provider
 
     def _resolve_path(self, path: str) -> Path:
         """Resolve path within workspace."""
@@ -323,6 +341,63 @@ class PaperSaveTool(Tool):
         self._ensure_dir(index_path)
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False, indent=2)
+
+    def _compute_method_id(self, paper_id: str, method_name: str) -> str:
+        """Generate a unique ID for a method."""
+        content = f"{paper_id}:{method_name}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    async def _quick_extract_methods(
+        self,
+        paper_id: str,
+        title: str,
+        abstract: str,
+    ) -> list[dict[str, Any]]:
+        """Extract methods from paper title and abstract using LLM.
+
+        Returns a list of method records with keys: id, paper_id, method_name,
+        task_type, description, module_interface, dependencies, extracted_at.
+        """
+        if not self._provider:
+            return []
+
+        prompt = QUICK_EXTRACT_METHODS_PROMPT.format(
+            title=title or "Unknown",
+            abstract=abstract[:2000] if abstract else "",
+        )
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            response = await self._provider.chat_with_retry(messages)
+            content = response.content or "[]"
+
+            # Parse JSON array from response
+            json_start = content.find("[")
+            json_end = content.rfind("]") + 1
+            if json_start < 0 or json_end <= json_start:
+                return []
+
+            json_str = content[json_start:json_end]
+            methods = json.loads(json_str)
+        except Exception:
+            return []
+
+        now = datetime.now(timezone.utc).isoformat()
+        validated = []
+        for m in methods:
+            if isinstance(m, dict) and m.get("method_name"):
+                method_id = self._compute_method_id(paper_id, m["method_name"])
+                validated.append({
+                    "id": method_id,
+                    "paper_id": paper_id,
+                    "method_name": m.get("method_name", ""),
+                    "task_type": m.get("task_type", "other"),
+                    "description": m.get("description", ""),
+                    "module_interface": m.get("module_interface", ""),
+                    "dependencies": m.get("dependencies", []) if isinstance(m.get("dependencies"), list) else [],
+                    "extracted_at": now,
+                })
+        return validated
 
     async def execute(
         self,
@@ -395,6 +470,22 @@ class PaperSaveTool(Tool):
             except Exception as e:
                 index_status = f"error: {e}"
                 logger.warning(f"Search index update failed for {paper_id}: {e}")
+
+        # Auto-extract methods if configured
+        if search_index is not None:
+            if getattr(getattr(getattr(self, '_config', None), 'literature', None), 'method_extraction', None):
+                method_extraction_config = self._config.literature.method_extraction
+                if method_extraction_config.auto_extract:
+                    try:
+                        title = paper_record.get("title", "")
+                        abstract = paper_record.get("abstract", "")
+                        methods = await self._quick_extract_methods(paper_id, title, abstract)
+                        for method in methods:
+                            await search_index.upsert_method_with_vector(method)
+                        if methods:
+                            logger.info(f"Extracted {len(methods)} methods from {paper_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to extract methods for {paper_id}: {e}")
 
         return (
             f"Saved paper: {paper_id}\n"

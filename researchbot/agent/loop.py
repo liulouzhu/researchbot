@@ -296,7 +296,7 @@ class AgentLoop:
 
         self.tools.register(PaperSearchTool(proxy=self.web_proxy))
         self.tools.register(PaperGetTool(proxy=self.web_proxy))
-        self.tools.register(PaperSaveTool(workspace=str(self.workspace), semantic_config=semantic_config))
+        self.tools.register(PaperSaveTool(workspace=str(self.workspace), semantic_config=semantic_config, config=self._config, provider=self.provider))
         self.tools.register(PaperSummarizeTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(PaperDownloadPdfTool(workspace=str(self.workspace), proxy=self.web_proxy))
         self.tools.register(PaperExtractTextTool(workspace=str(self.workspace), proxy=self.web_proxy))
