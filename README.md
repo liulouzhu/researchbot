@@ -16,6 +16,7 @@
 - **引文导出** (`paper_cite`): 将论文导出为 BibTeX、RIS、CSL-JSON、APA、MLA、GB/T 7714 格式
 - **方法提取** (`method_extract`/`method_search`): 从论文中提取可复用的技术方法和模块，形成可搜索的方法库；保存论文时自动提取，支持自然语言搜索和任务类型筛选
 - **论文推荐** (`paper_recommend`): 基于收藏论文或研究主题推荐相关新论文，带推荐理由
+- **文献调研报告** (`literature_survey`): 给定主题，自动完成搜索→高引筛选→方法提取→空白分析→生成结构化 Markdown 报告
 - **研究空白发现** (`research_gap_discovery`): 分析论文发现"未被解决的问题"，生成带证据链的交互式报告，支持深入追问
 - **创新点生成** (`innovation_workflow`): 从研究主题出发，经历候选生成 → 查新评估 → 审阅评分 → 多轮迭代收敛四个阶段；支持双模型协作，引入外部评审者打破单一模型思维盲点
 
@@ -249,6 +250,15 @@ researchbot agent -m "paper_recommend mode=\"collection\" paper_ids=[\"2301.1234
 
 # 基于主题推荐
 researchbot agent -m "paper_recommend mode=\"topic\" topic=\"LLM\""
+
+# CLI 使用
+researchbot paper survey "LLM security"
+
+# 指定参数
+researchbot paper survey "LLM security" --depth=standard --max-papers=30
+
+# Agent 对话
+researchbot agent -m "调研 LLM security 相关研究"
 
 # 基于收藏论文发现研究空白
 researchbot agent -m "research_gap_discovery mode=\"collection\" paper_ids=[\"2301.12345\",\"2212.67890\"]"
