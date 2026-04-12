@@ -293,6 +293,7 @@ class AgentLoop:
         from researchbot.agent.tools.paper_cite import PaperCiteTool
         from researchbot.agent.tools.paper_recommend import PaperRecommendTool
         from researchbot.agent.tools.innovation import InnovationWorkflowTool
+        from researchbot.agent.tools.research_gap_discovery import ResearchGapDiscoveryTool
         semantic_config = getattr(self.literature_config, "semantic_search", None) if self.literature_config else None
 
         # Crossref/OpenAlex config for enrichment tools
@@ -314,6 +315,11 @@ class AgentLoop:
         self.tools.register(PaperCompareTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(PaperReviewTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))
         self.tools.register(InnovationWorkflowTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, innovation_config=self.innovation_config, config=self._config, proxy=self.web_proxy))
+        gap_config = getattr(self.literature_config, "gap_discovery", None) if self.literature_config else None
+        self.tools.register(ResearchGapDiscoveryTool(
+            workspace=str(self.workspace),
+            config=gap_config,
+        ))
         self.tools.register(PaperRecommendTool(
             workspace=str(self.workspace),
             semantic_config=semantic_config,
