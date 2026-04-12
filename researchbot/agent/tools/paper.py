@@ -196,6 +196,97 @@ class PaperSearchTool(Tool):
         # 格式化输出
         return self._format_aggregated_results(aggregated, query)
 
+    def _aggregate_results(
+        self,
+        arxiv_results: list,
+        crossref_results: list,
+        openalex_results: list,
+    ) -> list[dict]:
+        """Aggregate results from all sources with DOI deduplication.
+
+        Returns a list of aggregated paper records:
+        {
+            "title": str,
+            "authors": list[str],
+            "year": int | None,
+            "venue": str | None,
+            "citations": int | None,
+            "doi": str | None,
+            "arxiv_id": str | None,
+            "sources": list[str],
+            "combined_score": float,
+        }
+        """
+        papers: dict[str, dict] = {}
+
+        # 处理 arXiv 结果
+        for entry in arxiv_results:
+            key = f"arxiv:{entry.paper_id}"
+            papers[key] = {
+                "title": entry.title,
+                "authors": entry.authors,
+                "year": int(entry.published[:4]) if entry.published else None,
+                "venue": None,
+                "citations": None,
+                "doi": entry.doi,
+                "arxiv_id": entry.paper_id,
+                "sources": ["arxiv"],
+                "combined_score": 1.0,
+            }
+
+        # 处理 Crossref 结果
+        for work in crossref_results:
+            doi = work.doi
+            if not doi:
+                continue
+            key = f"doi:{doi}"
+            if key in papers:
+                papers[key]["citations"] = max(papers[key]["citations"] or 0, work.cited_by_count or 0)
+                papers[key]["sources"].append("crossref")
+                if work.journal:
+                    papers[key]["venue"] = work.journal
+            else:
+                papers[key] = {
+                    "title": work.title,
+                    "authors": work.authors,  # list[str]
+                    "year": int(work.year) if work.year else None,
+                    "venue": work.journal,
+                    "citations": work.cited_by_count,
+                    "doi": doi,
+                    "arxiv_id": None,
+                    "sources": ["crossref"],
+                    "combined_score": 1.0,
+                }
+
+        # 处理 OpenAlex 结果
+        for work in openalex_results:
+            doi = work.doi
+            if not doi:
+                continue
+            key = f"doi:{doi}"
+            if key in papers:
+                papers[key]["citations"] = max(papers[key]["citations"] or 0, work.cited_by_count or 0)
+                papers[key]["sources"].append("openalex")
+                if work.journal:
+                    papers[key]["venue"] = papers[key]["venue"] or work.journal
+            else:
+                papers[key] = {
+                    "title": work.title,
+                    "authors": work.authors,
+                    "year": int(work.year) if work.year else None,
+                    "venue": work.journal,
+                    "citations": work.cited_by_count,
+                    "doi": doi,
+                    "arxiv_id": None,
+                    "sources": ["openalex"],
+                    "combined_score": 1.0,
+                }
+
+        # 按综合分数排序
+        result = list(papers.values())
+        result.sort(key=lambda x: x["combined_score"], reverse=True)
+        return result
+
 
 def paper_to_dict(entry: PaperEntry) -> dict[str, Any]:
     """Convert PaperEntry to full standardized dict for paper_get output."""
