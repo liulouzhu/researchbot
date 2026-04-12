@@ -297,12 +297,14 @@ class AgentLoop:
         # Crossref/OpenAlex config for enrichment tools
         crossref_config = getattr(self.literature_config, "crossref", None) if self.literature_config else None
         openalex_config = getattr(self.literature_config, "openalex", None) if self.literature_config else None
+        semantic_scholar_config = getattr(self.literature_config, "semantic_scholar", None) if self.literature_config else None
 
         crossref_mailto = getattr(crossref_config, "mailto", None) if crossref_config else None
         crossref_ua = getattr(crossref_config, "user_agent", None) if crossref_config else None
         openalex_api_key = getattr(openalex_config, "api_key", None) if openalex_config else None
+        semantic_scholar_api_key = getattr(semantic_scholar_config, "api_key", None) if semantic_scholar_config else None
 
-        self.tools.register(PaperSearchTool(proxy=self.web_proxy, mailto=crossref_mailto))
+        self.tools.register(PaperSearchTool(proxy=self.web_proxy, mailto=crossref_mailto, semantic_scholar_api_key=semantic_scholar_api_key))
         self.tools.register(PaperGetTool(proxy=self.web_proxy))
         self.tools.register(PaperSaveTool(workspace=str(self.workspace), semantic_config=semantic_config, config=self._config, provider=self.provider))
         self.tools.register(PaperSummarizeTool(provider=self.provider, workspace=str(self.workspace), semantic_config=semantic_config, proxy=self.web_proxy))

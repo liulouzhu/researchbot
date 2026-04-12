@@ -21,7 +21,8 @@ from researchbot.agent.tools.arxiv_client import (
 )
 from researchbot.agent.tools.crossref_client import search_crossref
 from researchbot.agent.tools.openalex_client import search_openalex
-from researchbot.config.schema import MethodExtractionConfig, SemanticSearchConfig
+from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar
+from researchbot.config.schema import MethodExtractionConfig, SemanticScholarConfig, SemanticSearchConfig
 from researchbot.search_index import SearchIndex
 from researchbot.utils.helpers import compute_short_id, extract_json_array
 
@@ -131,9 +132,10 @@ class PaperSearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, proxy: str | None = None, mailto: str | None = None):
+    def __init__(self, proxy: str | None = None, mailto: str | None = None, semantic_scholar_api_key: str | None = None):
         self.proxy = proxy
         self._mailto = mailto
+        self._semantic_scholar_api_key = semantic_scholar_api_key
 
     async def execute(
         self,
@@ -164,7 +166,7 @@ class PaperSearchTool(Tool):
 
     async def _search_all_sources(self, query: str, max_per_source: int) -> str:
         """Search across all sources and aggregate results."""
-        # 并行发起三个搜索
+        # 并行发起四个搜索
         arxiv_task = search_arxiv(
             query=query,
             max_results=max_per_source,
@@ -180,19 +182,27 @@ class PaperSearchTool(Tool):
             query=query,
             max_results=max_per_source,
         )
+        semantic_scholar_task = search_semantic_scholar(
+            query=query,
+            max_results=max_per_source,
+            api_key=getattr(self, '_semantic_scholar_api_key', None),
+        )
 
         # 等待所有搜索完成，捕获异常
         results = await asyncio.gather(
-            arxiv_task, crossref_task, openalex_task,
+            arxiv_task, crossref_task, openalex_task, semantic_scholar_task,
             return_exceptions=True
         )
 
         arxiv_results = results[0] if not isinstance(results[0], Exception) else []
         crossref_results = results[1] if not isinstance(results[1], Exception) else []
         openalex_results = results[2] if not isinstance(results[2], Exception) else []
+        semantic_scholar_results = results[3] if not isinstance(results[3], Exception) else []
 
         # 聚合结果
-        aggregated = self._aggregate_results(arxiv_results, crossref_results, openalex_results)
+        aggregated = self._aggregate_results(
+            arxiv_results, crossref_results, openalex_results, semantic_scholar_results
+        )
 
         # 格式化输出
         return self._format_aggregated_results(aggregated, query)
@@ -202,6 +212,7 @@ class PaperSearchTool(Tool):
         arxiv_results: list,
         crossref_results: list,
         openalex_results: list,
+        semantic_scholar_results: list = [],
     ) -> list[dict]:
         """Aggregate results from all sources with DOI deduplication.
 
@@ -298,6 +309,39 @@ class PaperSearchTool(Tool):
                     "doi": doi,
                     "arxiv_id": None,
                     "sources": ["openalex"],
+                    "combined_score": 1.0,
+                }
+
+        # Process Semantic Scholar results
+        for work in semantic_scholar_results:
+            doi = work.doi
+            # Check if we have an arXiv entry with this DOI
+            arxiv_key = doi_to_arxiv_key.get(doi) if doi else None
+            if arxiv_key:
+                papers[arxiv_key]["citations"] = max(papers[arxiv_key]["citations"] or 0, work.citation_count or 0)
+                papers[arxiv_key]["sources"].append("semantic_scholar")
+                if work.venue:
+                    papers[arxiv_key]["venue"] = papers[arxiv_key]["venue"] or work.venue
+                # Also add arXiv ID if available
+                if work.arxiv_id and not papers[arxiv_key]["arxiv_id"]:
+                    papers[arxiv_key]["arxiv_id"] = work.arxiv_id
+            elif doi and f"doi:{doi}" in papers:
+                papers[f"doi:{doi}"]["citations"] = max(papers[f"doi:{doi}"]["citations"] or 0, work.citation_count or 0)
+                papers[f"doi:{doi}"]["sources"].append("semantic_scholar")
+                if work.venue:
+                    papers[f"doi:{doi}"]["venue"] = papers[f"doi:{doi}"]["venue"] or work.venue
+            else:
+                # Use Semantic Scholar paper ID as key
+                key = f"s2:{work.paper_id}"
+                papers[key] = {
+                    "title": work.title,
+                    "authors": work.authors,
+                    "year": work.year,
+                    "venue": work.venue,
+                    "citations": work.citation_count,
+                    "doi": doi,
+                    "arxiv_id": work.arxiv_id,
+                    "sources": ["semantic_scholar"],
                     "combined_score": 1.0,
                 }
 

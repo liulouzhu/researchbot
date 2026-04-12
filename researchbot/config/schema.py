@@ -173,6 +173,13 @@ class OpenAlexConfig(Base):
     api_base: str = "https://api.openalex.org"  # API base URL
 
 
+class SemanticScholarConfig(Base):
+    """Semantic Scholar API configuration."""
+
+    api_key: str = ""  # API key (optional, higher rate limits with key)
+    api_base: str = "https://api.semanticscholar.org/graph/v1"  # API base URL
+
+
 class SemanticSearchConfig(Base):
     """Local semantic search configuration using SQLite."""
 
@@ -206,8 +213,9 @@ class LiteratureConfig(Base):
 
     crossref: CrossrefConfig = Field(default_factory=CrossrefConfig)
     openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
+    semantic_scholar: SemanticScholarConfig = Field(default_factory=SemanticScholarConfig)
     semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
-    method_extraction: MethodExtractionConfig = Field(default_factory=MethodExtractionConfig)  # 新增
+    method_extraction: MethodExtractionConfig = Field(default_factory=MethodExtractionConfig)
 
 
 class InnovationConfig(Base):
