@@ -1,0 +1,36 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+dist
+build
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov
+tests
+
+# Virtual environments
+.env
+.venv
+venv
+
+# Documentation
+*.md
+!README.md
+LICENSE
+
+# Misc
+.DS_Store
+*.log
