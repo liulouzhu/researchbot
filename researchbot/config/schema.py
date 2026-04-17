@@ -180,6 +180,13 @@ class SemanticScholarConfig(Base):
     api_base: str = "https://api.semanticscholar.org/graph/v1"  # API base URL
 
 
+class UnpaywallConfig(Base):
+    """Unpaywall API configuration for OA PDF resolution."""
+
+    email: str = ""  # Required email for Unpaywall polite pool
+    api_base: str = "https://api.unpaywall.org"  # API base URL
+
+
 class RecommendationConfig(Base):
     """Paper recommendation configuration."""
 
@@ -222,6 +229,7 @@ class LiteratureConfig(Base):
     crossref: CrossrefConfig = Field(default_factory=CrossrefConfig)
     openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
     semantic_scholar: SemanticScholarConfig = Field(default_factory=SemanticScholarConfig)
+    unpaywall: UnpaywallConfig = Field(default_factory=UnpaywallConfig)
     semantic_search: SemanticSearchConfig = Field(default_factory=SemanticSearchConfig)
     method_extraction: MethodExtractionConfig = Field(default_factory=MethodExtractionConfig)
     recommendation: RecommendationConfig = Field(default_factory=RecommendationConfig)

@@ -24,9 +24,13 @@ class LiteratureSurveyPipeline:
         self,
         workspace: str | None = None,
         config: LiteratureSurveyConfig | None = None,
+        unpaywall_email: str = "",
+        proxy: str | None = None,
     ):
         self._workspace = workspace
         self._config = config or LiteratureSurveyConfig()
+        self._unpaywall_email = unpaywall_email
+        self._proxy = proxy
         self._search_tool = PaperSearchTool()
 
     async def execute(
@@ -117,13 +121,32 @@ class LiteratureSurveyPipeline:
         return sorted_papers[:max_papers]
 
     async def _save_papers(self, papers: list[dict], topic: str) -> None:
-        """Save papers to local database."""
+        """Save papers to local database and try to fetch full text for each."""
         from researchbot.agent.tools.paper import PaperSaveTool
+        from researchbot.agent.tools.fulltext import ensure_full_text
+
         save_tool = PaperSaveTool(workspace=self._workspace)
         await asyncio.gather(*[
             save_tool.execute(paper=paper, topic=topic)
             for paper in papers
         ], return_exceptions=True)
+
+        # After saving, try to fetch full text for each paper
+        if self._workspace:
+            workspace_path = Path(self._workspace)
+
+            async def _fetch_one(paper: dict) -> None:
+                try:
+                    await ensure_full_text(
+                        paper,
+                        workspace=workspace_path,
+                        proxy=self._proxy,
+                        unpaywall_email=self._unpaywall_email,
+                    )
+                except Exception:
+                    pass
+
+            await asyncio.gather(*[_fetch_one(p) for p in papers], return_exceptions=True)
 
     async def _extract_methods(self, papers: list[dict]) -> list[dict]:
         """Extract methods from papers."""

@@ -924,11 +924,13 @@ class PaperSummarizeTool(Tool):
         workspace: str | None = None,
         proxy: str | None = None,
         semantic_config: SemanticSearchConfig | None = None,
+        unpaywall_email: str = "",
     ):
         self._provider = provider
         self._workspace = Path(workspace) if workspace else None
         self._proxy = proxy
         self._semantic_config = semantic_config
+        self._unpaywall_email = unpaywall_email
         self._search_index: SearchIndex | None = None
 
     def _resolve_path(self, path: str) -> Path:
@@ -1246,6 +1248,7 @@ class PaperSummarizeTool(Tool):
         if not resolved_paper:
             return "Error: Could not resolve paper information"
 
+        # Try to auto-fetch full text if not already available
         text_source = "abstract"
         if self._workspace and resolved_paper_id and resolved_paper_id != "unknown":
             extracted_path = self._resolve_path(f"literature/extracted/{resolved_paper_id}.txt")
@@ -1254,6 +1257,23 @@ class PaperSummarizeTool(Tool):
                     with open(extracted_path, "r", encoding="utf-8") as f:
                         resolved_paper["extracted_text"] = f.read()
                     text_source = "full_text"
+                except Exception:
+                    pass
+            else:
+                # No extracted text yet — try auto-fetch via OA / Unpaywall
+                try:
+                    from researchbot.agent.tools.fulltext import ensure_full_text
+                    await ensure_full_text(
+                        resolved_paper,
+                        workspace=self._workspace,
+                        proxy=self._proxy,
+                        unpaywall_email=self._unpaywall_email,
+                    )
+                    # Re-check after fetch attempt
+                    if extracted_path.exists():
+                        with open(extracted_path, "r", encoding="utf-8") as f:
+                            resolved_paper["extracted_text"] = f.read()
+                        text_source = "full_text"
                 except Exception:
                     pass
 
@@ -1302,21 +1322,25 @@ def _generate_pdf_url(paper_id: str) -> str:
 
 
 class PaperDownloadPdfTool(Tool):
-    """Download arXiv paper PDF to local storage."""
+    """Download paper PDF to local storage (arXiv, DOI/OA, or direct URL)."""
 
     name = "paper_download_pdf"
-    description = "Download arXiv paper PDF to local literature storage."
+    description = "Download paper PDF to local literature storage. Supports arXiv papers, DOI-based open-access resolution, and direct URLs."
 
     parameters = {
         "type": "object",
         "properties": {
             "paper_id": {
                 "type": "string",
-                "description": "arXiv paper ID (e.g. '2401.12345' or '2401.12345v2')",
+                "description": "Paper ID (e.g. arXiv '2401.12345' or any identifier)",
             },
             "url": {
                 "type": "string",
-                "description": "arXiv URL (e.g. 'https://arxiv.org/abs/2401.12345')",
+                "description": "arXiv URL or direct PDF URL",
+            },
+            "doi": {
+                "type": "string",
+                "description": "DOI for open-access PDF resolution (e.g. '10.1234/abcd')",
             },
             "overwrite": {
                 "type": "boolean",
@@ -1331,9 +1355,11 @@ class PaperDownloadPdfTool(Tool):
         self,
         workspace: str | None = None,
         proxy: str | None = None,
+        unpaywall_email: str = "",
     ):
         self._workspace = Path(workspace) if workspace else None
         self._proxy = proxy
+        self._unpaywall_email = unpaywall_email
 
     def _resolve_path(self, path: str) -> Path:
         """Resolve path within workspace."""
@@ -1360,11 +1386,14 @@ class PaperDownloadPdfTool(Tool):
         self,
         paper_id: str | None = None,
         url: str | None = None,
+        doi: str | None = None,
         overwrite: bool = False,
         **kwargs: Any,
     ) -> str:
-        if not paper_id and not url:
-            return "Error: Either paper_id or url must be provided"
+        import re
+
+        if not paper_id and not url and not doi:
+            return "Error: paper_id, url, or doi must be provided"
 
         if not self._workspace:
             return "Error: workspace not configured"
@@ -1372,60 +1401,76 @@ class PaperDownloadPdfTool(Tool):
         pdfs_dir = self._resolve_path("literature/pdfs")
         self._ensure_dir(pdfs_dir)
 
-        if paper_id:
-            pdf_path = pdfs_dir / f"{paper_id}.pdf"
-            pdf_url = _generate_pdf_url(paper_id)
-        elif url:
-            import re
+        # Resolve paper_id from URL
+        if not paper_id and url:
             match = re.search(r"(\d+\.\d+[vV]\d+)", url)
             if not match:
                 match = re.search(r"(\d+\.\d+)", url)
-            if not match:
-                return f"Error: Could not extract paper ID from URL: {url}"
-            paper_id = match.group(1)
-            pdf_path = pdfs_dir / f"{paper_id}.pdf"
-            pdf_url = _generate_pdf_url(paper_id)
+            if match:
+                paper_id = match.group(1)
 
+        if not paper_id and doi:
+            paper_id = doi.replace("/", "_").replace(".", "_")
+
+        if not paper_id:
+            return "Error: Could not resolve paper_id from inputs"
+
+        pdf_path = pdfs_dir / f"{paper_id}.pdf"
+
+        # Check existing
         if not overwrite and pdf_path.exists():
             existing_size = pdf_path.stat().st_size
             if existing_size > 0:
-                local = self._load_local_paper(paper_id)
-                if local:
-                    local["pdf_path"] = str(pdf_path)
-                    local["pdf_url"] = pdf_url
-                    local.setdefault("status", {})
-                    local["status"]["pdf_downloaded"] = True
-                    json_path = self._resolve_path(f"literature/papers/{paper_id}.json")
-                    with open(json_path, "w", encoding="utf-8") as f:
-                        json.dump(local, f, ensure_ascii=False, indent=2)
                 return f"PDF already exists: {paper_id} ({existing_size} bytes)"
 
-        try:
-            async with httpx.AsyncClient(proxy=self._proxy) as client:
-                response = await client.get(pdf_url, timeout=60.0, follow_redirects=True)
-                response.raise_for_status()
+        # Build a paper dict for ensure_full_text
+        paper_dict: dict[str, Any] = {
+            "paper_id": paper_id,
+            "doi": doi or "",
+            "pdf_url": url or "",
+            "source": "",
+            "external_ids": {"doi": doi} if doi else {},
+        }
 
-            self._ensure_dir(pdf_path)
-            with open(pdf_path, "wb") as f:
-                f.write(response.content)
+        # Detect arXiv papers
+        if re.match(r"\d{4}\.\d{4,5}", paper_id):
+            paper_dict["source"] = "arxiv"
+        elif "arxiv.org" in (url or ""):
+            paper_dict["source"] = "arxiv"
+            m = re.search(r"(\d{4}\.\d{4,5}(?:v\d+)?)", url)
+            if m:
+                paper_dict["paper_id"] = m.group(1)
+                paper_id = m.group(1)
+                pdf_path = pdfs_dir / f"{paper_id}.pdf"
 
-            local = self._load_local_paper(paper_id)
-            if local:
-                local["pdf_path"] = str(pdf_path)
-                local["pdf_url"] = pdf_url
-                local.setdefault("status", {})
-                local["status"]["pdf_downloaded"] = True
-                json_path = self._resolve_path(f"literature/papers/{paper_id}.json")
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(local, f, ensure_ascii=False, indent=2)
+        # Load existing paper record if available
+        local = self._load_local_paper(paper_id)
+        if local:
+            paper_dict.update(local)
+            if doi and not paper_dict.get("doi"):
+                paper_dict["doi"] = doi
 
-            file_size = len(response.content)
-            return f"Downloaded PDF: {paper_id}\n  PDF: {pdf_path}\n  Size: {file_size} bytes\n  URL: {pdf_url}"
+        # Use unified full-text fetching
+        from researchbot.agent.tools.fulltext import ensure_full_text
+        result = await ensure_full_text(
+            paper_dict,
+            workspace=self._workspace,
+            proxy=self._proxy,
+            unpaywall_email=self._unpaywall_email,
+        )
 
-        except httpx.HTTPError as e:
-            return f"Error downloading PDF: {e}"
-        except Exception as e:
-            return f"Error: {e}"
+        if result.get("pdf_path") and Path(result["pdf_path"]).exists():
+            size = Path(result["pdf_path"]).stat().st_size
+            source = result.get("text_source", "unknown")
+            return (
+                f"Downloaded PDF: {paper_id}\n"
+                f"  PDF: {result['pdf_path']}\n"
+                f"  Size: {size} bytes\n"
+                f"  Source: {source}\n"
+                f"  URL: {result.get('pdf_url', 'N/A')}"
+            )
+
+        return f"Could not obtain PDF for {paper_id}. No open-access version found."
 
 
 class PaperExtractTextTool(Tool):

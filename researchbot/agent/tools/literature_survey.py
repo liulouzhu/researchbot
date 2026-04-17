@@ -46,10 +46,12 @@ class LiteratureSurveyTool(Tool):
         self,
         workspace: str | None = None,
         config: LiteratureSurveyConfig | None = None,
+        unpaywall_email: str = "",
+        proxy: str | None = None,
     ):
         self._workspace = workspace
         self._config = config or LiteratureSurveyConfig()
-        self._pipeline = LiteratureSurveyPipeline(workspace, self._config)
+        self._pipeline = LiteratureSurveyPipeline(workspace, self._config, unpaywall_email=unpaywall_email, proxy=proxy)
 
     async def execute(
         self,

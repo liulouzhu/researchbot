@@ -419,6 +419,96 @@ def _slugify(text: str) -> str:
     return text[:60]
 
 
+def _compute_param_fingerprint(params: dict[str, Any]) -> str:
+    """Compute a stable fingerprint of workflow params for cache key purposes.
+
+    Excludes 'overwrite' since it doesn't affect result content.
+    """
+    import hashlib
+    # Remove keys that don't affect output
+    cacheable = {k: v for k, v in params.items() if k not in ("overwrite",)}
+    # JSON with sorted keys for determinism
+    canonical = json.dumps(cacheable, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def _check_cache_status(
+    output_dir: Path,
+    current_params: dict[str, Any],
+    cache_ttl_hours: float,
+) -> dict[str, Any]:
+    """Check whether cached workflow results are valid, expired, or absent.
+
+    Returns a dict with keys:
+        - ``status``: ``"hit"`` | ``"expired"`` | ``"miss"``
+        - ``generated_at``: ISO timestamp of cached run (if any)
+        - ``hours_ago``: hours since cached run (if any)
+        - ``reason``: human-readable explanation
+    """
+    workflow_file = output_dir / "workflow.json"
+    if not workflow_file.exists():
+        return {"status": "miss", "reason": "No previous workflow found"}
+
+    try:
+        cached = json.loads(workflow_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {"status": "miss", "reason": "Could not read cached workflow"}
+
+    # Check params fingerprint
+    cached_params = cached.get("params", {})
+    cached_fp = cached.get("param_fingerprint", "")
+    current_fp = _compute_param_fingerprint(current_params)
+
+    if cached_fp and cached_fp != current_fp:
+        return {
+            "status": "miss",
+            "reason": "Parameters changed since last run",
+        }
+    # Backward compat: if no fingerprint stored but params differ, treat as miss
+    if not cached_fp and cached_params:
+        # Compare the cacheable subset
+        cacheable_cached = {k: v for k, v in cached_params.items() if k != "overwrite"}
+        cacheable_current = {k: v for k, v in current_params.items() if k != "overwrite"}
+        if cacheable_cached != cacheable_current:
+            return {
+                "status": "miss",
+                "reason": "Parameters changed since last run",
+            }
+
+    # Check TTL
+    generated_at_str = cached.get("generated_at", "")
+    if not generated_at_str:
+        return {"status": "miss", "reason": "No generation timestamp in cache"}
+
+    try:
+        generated_at = datetime.fromisoformat(generated_at_str)
+        if generated_at.tzinfo is None:
+            generated_at = generated_at.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return {"status": "miss", "reason": "Invalid generation timestamp"}
+
+    now = datetime.now(timezone.utc)
+    elapsed = now - generated_at
+    hours_ago = elapsed.total_seconds() / 3600.0
+
+    if elapsed.total_seconds() > cache_ttl_hours * 3600:
+        return {
+            "status": "expired",
+            "generated_at": generated_at_str,
+            "hours_ago": round(hours_ago, 1),
+            "reason": f"Cache expired ({round(hours_ago, 1)}h ago, TTL={cache_ttl_hours}h)",
+        }
+
+    remaining_hours = cache_ttl_hours - hours_ago
+    return {
+        "status": "hit",
+        "generated_at": generated_at_str,
+        "hours_ago": round(hours_ago, 1),
+        "remaining_hours": round(remaining_hours, 1),
+        "reason": f"Cache hit (generated {round(hours_ago, 1)}h ago, {round(remaining_hours, 1)}h remaining)",
+    }
+
+
 def _format_papers_for_prompt(papers: list[dict[str, Any]]) -> str:
     """Format papers for the prompt."""
     if not papers:
@@ -1466,12 +1556,46 @@ class InnovationWorkflowTool(Tool):
         except Exception:
             return []
 
-    async def _search_multi_source(
+    async def _search_semantic_scholar(self, query: str, max_results: int = 8) -> list[dict[str, Any]]:
+        """Search Semantic Scholar for papers."""
+        try:
+            from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar, DEFAULT_TIMEOUT
+            works = await search_semantic_scholar(
+                query=query,
+                max_results=max_results,
+                timeout=DEFAULT_TIMEOUT,
+                proxy=self._proxy,
+            )
+            papers = []
+            for w in works:
+                papers.append({
+                    "paper_id": w.paper_id or w.doi or "",
+                    "title": w.title,
+                    "authors": w.authors,
+                    "abstract": w.abstract,
+                    "year": w.year,
+                    "published": w.year,
+                    "source": "semantic_scholar",
+                    "external_ids": {"doi": w.doi, "s2": w.paper_id} if w.doi else {"s2": w.paper_id},
+                    "journal": w.venue,
+                    "cited_by_count": w.citation_count,
+                    "url": f"https://www.semanticscholar.org/paper/{w.paper_id}" if w.paper_id else "",
+                })
+            return papers
+        except Exception:
+            return []
+
+    async def _search_online_novelty(
         self,
-        topic: str,
-        max_per_source: int = 8,
+        query: str,
+        max_results: int = 8,
     ) -> list[dict[str, Any]]:
-        """Search multiple academic sources and merge results, deduplicating by title similarity."""
+        """Search all online academic sources concurrently and deduplicate results.
+
+        Returns a deduplicated list of papers from arXiv, Crossref, OpenAlex, and
+        Semantic Scholar.  Individual source failures are silently ignored so that a
+        single broken backend never kills the whole novelty search.
+        """
         all_papers: list[dict[str, Any]] = []
         seen_titles: set[str] = set()
 
@@ -1482,11 +1606,11 @@ class InnovationWorkflowTool(Tool):
                     seen_titles.add(key)
                     all_papers.append(p)
 
-        # Run all three searches concurrently
         results = await asyncio.gather(
-            self._search_arxiv(topic, max_per_source),
-            self._search_crossref(topic, max_per_source),
-            self._search_openalex(topic, max_per_source),
+            self._search_arxiv(query, max_results),
+            self._search_crossref(query, max_results),
+            self._search_openalex(query, max_results),
+            self._search_semantic_scholar(query, max_results),
             return_exceptions=True,
         )
         for r in results:
@@ -1494,6 +1618,14 @@ class InnovationWorkflowTool(Tool):
                 _add_papers(r)
 
         return all_papers
+
+    async def _search_multi_source(
+        self,
+        topic: str,
+        max_per_source: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Search multiple academic sources and merge results, deduplicating by title similarity."""
+        return await self._search_online_novelty(topic, max_per_source)
 
     async def _build_literature_map(
         self,
@@ -2585,15 +2717,12 @@ class InnovationWorkflowTool(Tool):
 
             if search_online and keywords:
                 query = " OR ".join(keywords[:3])
-                try:
-                    arxiv_results = await self._search_arxiv(query, max_related)
-                    existing_ids = {p.get("paper_id") for p in related_papers}
-                    for p in arxiv_results:
-                        if p.get("paper_id") not in existing_ids:
-                            related_papers.append(p)
-                            existing_ids.add(p.get("paper_id"))
-                except Exception:
-                    pass
+                online_results = await self._search_online_novelty(query, max_related)
+                existing_ids = {p.get("paper_id") for p in related_papers}
+                for p in online_results:
+                    if p.get("paper_id") not in existing_ids:
+                        related_papers.append(p)
+                        existing_ids.add(p.get("paper_id"))
 
             # Store full paper info
             full_related_papers: list[dict[str, Any]] = []
@@ -2827,77 +2956,93 @@ class InnovationWorkflowTool(Tool):
         # If workflow already completed and overwrite=False, return cached results directly
         # This makes repeated identical calls idempotent
         if not overwrite:
-            workflow_file = innovation_dir / "workflow.json"
-            if workflow_file.exists():
-                try:
-                    cached = json.loads(workflow_file.read_text(encoding="utf-8"))
-                    if cached.get("overall_status") == "completed":
-                        iteration_data = cached.get("iteration", {})
-                        rounds_completed = iteration_data.get("rounds_completed", 0)
-                        stopping_reason = iteration_data.get("stopping_reason", "cached")
-                        # Load existing reports
-                        iteration_json = innovation_dir / "iteration_report.json"
-                        iteration_md = innovation_dir / "iteration_report.md"
-                        # Load rounds data from per-round review files
-                        rounds_data: list[dict[str, Any]] = []
-                        all_proceed_candidates: list[dict[str, Any]] = []
-                        if (innovation_dir / "iterations").exists():
-                            for round_dir in sorted((innovation_dir / "iterations").iterdir()):
-                                if round_dir.is_dir() and round_dir.name.startswith("round_"):
-                                    review_file = round_dir / "review_report.json"
-                                    if review_file.exists():
-                                        rd = json.loads(review_file.read_text(encoding="utf-8"))
-                                        results = rd.get("results", [])
-                                        rounds_data.append({
-                                            "round": rd.get("round", 0),
-                                            "status": "completed",
-                                            "completed_at": rd.get("generated_at", ""),
-                                            "results": results,
-                                            "counts": rd.get("summary", {}),
-                                        })
-                                        # Collect all proceed candidates
-                                        for r in results:
-                                            if r.get("review", {}).get("decision", "").lower() == "proceed":
-                                                all_proceed_candidates.append(r)
-                        # Reconstruct top candidates
-                        lineage_map: dict[str, dict[str, Any]] = {}
-                        for cand in all_proceed_candidates:
-                            c = cand.get("candidate", {})
-                            lineage_key = c.get("parent_candidate") or c.get("title", "")
-                            if not lineage_key:
-                                continue
-                            score = cand.get("review", {}).get("overall_score", 0)
-                            existing = lineage_map.get(lineage_key)
-                            if existing is None:
-                                lineage_map[lineage_key] = cand
-                            else:
-                                existing_score = existing.get("review", {}).get("overall_score", 0)
-                                existing_round = existing.get("candidate", {}).get("revision_round", 0)
-                                cand_round = c.get("revision_round", 0)
-                                if (score > existing_score) or (
-                                    score == existing_score and cand_round > existing_round
-                                ):
+            # Check cache TTL & param fingerprint first
+            cache_status = _check_cache_status(innovation_dir, metadata["params"], metadata.get("cache_ttl_hours", 48.0))
+            if cache_status["status"] == "hit":
+                workflow_file = innovation_dir / "workflow.json"
+                if workflow_file.exists():
+                    try:
+                        cached = json.loads(workflow_file.read_text(encoding="utf-8"))
+                        if cached.get("overall_status") == "completed":
+                            iteration_data = cached.get("iteration", {})
+                            rounds_completed = iteration_data.get("rounds_completed", 0)
+                            stopping_reason = iteration_data.get("stopping_reason", "cached")
+                            # Load existing reports
+                            iteration_json = innovation_dir / "iteration_report.json"
+                            iteration_md = innovation_dir / "iteration_report.md"
+                            # Load rounds data from per-round review files
+                            rounds_data: list[dict[str, Any]] = []
+                            all_proceed_candidates: list[dict[str, Any]] = []
+                            if (innovation_dir / "iterations").exists():
+                                for round_dir in sorted((innovation_dir / "iterations").iterdir()):
+                                    if round_dir.is_dir() and round_dir.name.startswith("round_"):
+                                        review_file = round_dir / "review_report.json"
+                                        if review_file.exists():
+                                            rd = json.loads(review_file.read_text(encoding="utf-8"))
+                                            results = rd.get("results", [])
+                                            rounds_data.append({
+                                                "round": rd.get("round", 0),
+                                                "status": "completed",
+                                                "completed_at": rd.get("generated_at", ""),
+                                                "results": results,
+                                                "counts": rd.get("summary", {}),
+                                            })
+                                            # Collect all proceed candidates
+                                            for r in results:
+                                                if r.get("review", {}).get("decision", "").lower() == "proceed":
+                                                    all_proceed_candidates.append(r)
+                            # Reconstruct top candidates
+                            lineage_map: dict[str, dict[str, Any]] = {}
+                            for cand in all_proceed_candidates:
+                                c = cand.get("candidate", {})
+                                lineage_key = c.get("parent_candidate") or c.get("title", "")
+                                if not lineage_key:
+                                    continue
+                                score = cand.get("review", {}).get("overall_score", 0)
+                                existing = lineage_map.get(lineage_key)
+                                if existing is None:
                                     lineage_map[lineage_key] = cand
-                        final_sorted = sorted(
-                            lineage_map.values(),
-                            key=lambda x: (
-                                x.get("review", {}).get("overall_score", 0),
-                                x.get("candidate", {}).get("revision_round", 0),
-                            ),
-                            reverse=True,
-                        )[:top_k]
-                        # Dual-model: external reviewer evaluates iteration results
-                        if reviewer_model:
-                            await self._run_external_iteration_review(
-                                topic, innovation_dir, rounds_data, final_sorted,
+                                else:
+                                    existing_score = existing.get("review", {}).get("overall_score", 0)
+                                    existing_round = existing.get("candidate", {}).get("revision_round", 0)
+                                    cand_round = c.get("revision_round", 0)
+                                    if (score > existing_score) or (
+                                        score == existing_score and cand_round > existing_round
+                                    ):
+                                        lineage_map[lineage_key] = cand
+                            final_sorted = sorted(
+                                lineage_map.values(),
+                                key=lambda x: (
+                                    x.get("review", {}).get("overall_score", 0),
+                                    x.get("candidate", {}).get("revision_round", 0),
+                                ),
+                                reverse=True,
+                            )[:top_k]
+                            # Dual-model: external reviewer evaluates iteration results
+                            if reviewer_model:
+                                await self._run_external_iteration_review(
+                                    topic, innovation_dir, rounds_data, final_sorted,
+                                )
+                            # Add cache hit notice to output
+                            _save_workflow_metadata(metadata, self._workspace, topic)
+                            base_output = self._build_iteration_output(
+                                topic, rounds_data, final_sorted,
+                                stopping_reason, innovation_dir,
+                                str(iteration_json), str(iteration_md),
                             )
-                        return self._build_iteration_output(
-                            topic, rounds_data, final_sorted,
-                            stopping_reason, innovation_dir,
-                            str(iteration_json), str(iteration_md),
-                        )
-                except Exception:
-                    pass  # Fall through to re-run if cache read fails
+                            cs = cache_status
+                            return (
+                                base_output
+                                + f"\n\n> **Cache hit**: 本次返回的是缓存结果"
+                                f"（生成于 {cs['hours_ago']}h 前，"
+                                f"剩余 {cs.get('remaining_hours', '?')}h 过期）。\n"
+                                f"> 如需重新生成，请传 `overwrite=True`。\n"
+                            )
+                    except Exception:
+                        pass  # Fall through to re-run if cache read fails
+            elif cache_status["status"] == "expired":
+                # Cache expired — fall through to re-run
+                pass
 
         now = utc_now()
 
@@ -3321,6 +3466,7 @@ class InnovationWorkflowTool(Tool):
         landscape_max_online: int = 8,
         reviewer_model: str | None = None,
         executor_model: str | None = None,
+        cache_ttl_hours: float = 48.0,
         **kwargs: Any,
     ) -> str:
         topic = kwargs.get("topic")
@@ -3344,6 +3490,7 @@ class InnovationWorkflowTool(Tool):
                 overwrite, enable_iteration, max_rounds, min_proceed,
                 revise_top_k, stop_if_no_change, enable_landscape,
                 landscape_max_online, reviewer_model, executor_model,
+                cache_ttl_hours,
             )
 
     async def _execute_impl(
@@ -3366,6 +3513,7 @@ class InnovationWorkflowTool(Tool):
         landscape_max_online: int,
         reviewer_model: str | None,
         executor_model: str | None,
+        cache_ttl_hours: float = 48.0,
     ) -> str:
         output_dir = self._resolve_path(f"innovation/{slug}")
 
@@ -3385,6 +3533,17 @@ class InnovationWorkflowTool(Tool):
 
         # Build workflow metadata with input params
         metadata = _workflow_info()
+
+        # Preserve original generated_at from existing workflow.json so that TTL
+        # checks see the original generation time, not the time we re-entered
+        existing_workflow_file = output_dir / "workflow.json"
+        if existing_workflow_file.exists():
+            try:
+                existing = json.loads(existing_workflow_file.read_text(encoding="utf-8"))
+                if existing.get("generated_at"):
+                    metadata["generated_at"] = existing["generated_at"]
+            except Exception:
+                pass  # Use freshly-generated timestamp
         iteration_params = {
             "enable_iteration": enable_iteration,
             "max_rounds": max_rounds,
@@ -3404,6 +3563,8 @@ class InnovationWorkflowTool(Tool):
             "landscape_max_online": landscape_max_online,
         }
         metadata["params"].update(iteration_params)
+        metadata["param_fingerprint"] = _compute_param_fingerprint(metadata["params"])
+        metadata["cache_ttl_hours"] = cache_ttl_hours
 
         # =====================================================================
         # Stage 0: Landscape survey (optional, before everything else)
@@ -3470,6 +3631,16 @@ class InnovationWorkflowTool(Tool):
         if not enable_review and novelty_exists and not overwrite:
             skip_stage3 = True
 
+        # Cache TTL & param fingerprint check — may invalidate skip flags
+        cache_status = None
+        if not overwrite and (skip_stage1 or skip_stage2 or skip_stage3):
+            cache_status = _check_cache_status(output_dir, metadata["params"], cache_ttl_hours)
+            if cache_status["status"] in ("expired", "miss"):
+                # Force re-execution of all stages
+                skip_stage1 = False
+                skip_stage2 = False
+                skip_stage3 = False
+
         # Short-circuit: all results exist and no new work needed
         if skip_stage1 and skip_stage2 and skip_stage3:
             now = utc_now()
@@ -3516,11 +3687,30 @@ class InnovationWorkflowTool(Tool):
             })
             metadata["overall_status"] = "completed"
             workflow_path = _save_workflow_metadata(metadata, self._workspace, topic)
+            # Build cache info message
+            cache_info = ""
+            if cache_status:
+                cs = cache_status
+                if cs["status"] == "hit":
+                    cache_info = (
+                        f"\n> **Cache hit**: 本次返回的是缓存结果"
+                        f"（生成于 {cs['hours_ago']}h 前，"
+                        f"剩余 {cs.get('remaining_hours', '?')}h 过期）。\n"
+                        f"> 如需重新生成，请传 `overwrite=True`。\n"
+                    )
+                elif cs["status"] == "expired":
+                    cache_info = (
+                        f"\n> **Cache expired**: 缓存已过期"
+                        f"（生成于 {cs['hours_ago']}h 前，TTL={cache_ttl_hours}h），"
+                        f"已自动重新生成。\n"
+                    )
+
             return (
                 f"# Innovation Workflow: {topic}\n"
                 f"\n**All stages already complete (reused existing results).**\n"
                 f"**Output directory**: {output_dir}\n"
                 f"**Workflow metadata**: {workflow_path}\n"
+                f"{cache_info}"
                 f"\nUse overwrite=True to regenerate all stages."
             )
 
@@ -3658,15 +3848,12 @@ class InnovationWorkflowTool(Tool):
 
                 if search_online and keywords:
                     query = " OR ".join(keywords[:3])
-                    try:
-                        arxiv_results = await self._search_arxiv(query, max_related)
-                        existing_ids = {p.get("paper_id") for p in related_papers}
-                        for p in arxiv_results:
-                            if p.get("paper_id") not in existing_ids:
-                                related_papers.append(p)
-                                existing_ids.add(p.get("paper_id"))
-                    except Exception:
-                        pass
+                    online_results = await self._search_online_novelty(query, max_related)
+                    existing_ids = {p.get("paper_id") for p in related_papers}
+                    for p in online_results:
+                        if p.get("paper_id") not in existing_ids:
+                            related_papers.append(p)
+                            existing_ids.add(p.get("paper_id"))
 
                 analysis = await self._analyze_novelty(candidate, related_papers)
 

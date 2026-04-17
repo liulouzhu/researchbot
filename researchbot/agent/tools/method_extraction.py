@@ -148,10 +148,14 @@ class MethodExtractionTool(Tool):
         provider: Any = None,
         workspace: str | None = None,
         semantic_config: SemanticSearchConfig | None = None,
+        unpaywall_email: str = "",
+        proxy: str | None = None,
     ):
         self._provider = provider
         self._workspace = workspace
         self._semantic_config = semantic_config
+        self._unpaywall_email = unpaywall_email
+        self._proxy = proxy
         self._search_index: SearchIndex | None = None
 
     def _get_search_index(self) -> SearchIndex | None:
@@ -249,6 +253,29 @@ class MethodExtractionTool(Tool):
                     with open(extracted_path, "r", encoding="utf-8") as f:
                         fulltext = f.read()
                     use_fulltext = True
+
+            # Auto-fetch full text if not found locally
+            if not use_fulltext and self._workspace:
+                try:
+                    from pathlib import Path
+                    from researchbot.agent.tools.fulltext import ensure_full_text
+                    paper_dict = dict(local_paper)
+                    await ensure_full_text(
+                        paper_dict,
+                        workspace=Path(self._workspace),
+                        proxy=self._proxy,
+                        unpaywall_email=self._unpaywall_email,
+                    )
+                    # Re-check after fetch
+                    reloaded = self._load_local_paper(paper_id)
+                    if reloaded and reloaded.get("extracted_text_path"):
+                        ep = Path(reloaded["extracted_text_path"])
+                        if ep.exists():
+                            with open(ep, "r", encoding="utf-8") as f:
+                                fulltext = f.read()
+                            use_fulltext = True
+                except Exception:
+                    pass
 
         # Get abstract and title
         if local_paper:
