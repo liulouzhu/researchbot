@@ -64,21 +64,88 @@ def _safe_id(s: str) -> str:
 class KnowledgeGraph:
     """Knowledge graph backed by SQLite (same file as SearchIndex).
 
-    Shares the connection with SearchIndex — call SearchIndex.initialize()
-    before using any graph methods.
+    Connection strategy:
+    - **Own connection**: When constructed with a `db_path` (str/Path), KG
+      manages its own connection with WAL/busy_timeout. Used for read-only
+      queries and bulk rebuild operations.
+    - **Borrowed connection**: When constructed with a `conn` (sqlite3.Connection),
+      KG writes to that connection so the caller controls the transaction.
+      Used by SearchIndex.upsert_paper to keep paper+graph writes atomic.
 
     Usage:
-        kg = KnowledgeGraph(search_index)  # shares the same db connection
-        await kg.upsert_paper(paper_dict)   # write all graph edges for a paper
+        # Option 1: own connection (for reads, rebuild)
+        kg = KnowledgeGraph(db_path="/path/to/search.sqlite3")
         citing = kg.get_citing_papers("paper_id")
-        coauthors = kg.get_co_authors("vaswani_a")
+        kg.close()
+
+        # Option 2: borrowed connection (for atomic upsert with SearchIndex)
+        kg = KnowledgeGraph(conn=search_index._get_conn())
+        kg.upsert_paper(paper, commit=False)
+        # caller commits
     """
 
-    def __init__(self, search_index: "SearchIndex"):  # noqa: F821
-        self._si = search_index
+    def __init__(
+        self,
+        search_index_or_db: "SearchIndex | str | Path | None" = None,  # noqa: F821
+        *,
+        conn: sqlite3.Connection | None = None,
+        db_path: str | Path | None = None,
+    ):
+        self._db_path: Path | None = None
+        self._local_conn: sqlite3.Connection | None = None
+        self._owns_connection: bool = False
 
-    def _conn(self) -> sqlite3.Connection:
-        return self._si._get_conn()
+        # Priority 1: explicit conn (borrowed)
+        if conn is not None:
+            self._local_conn = conn
+            self._owns_connection = False
+            return
+
+        # Priority 2: explicit db_path
+        if db_path is not None:
+            self._db_path = Path(db_path)
+            self._owns_connection = True
+            return
+
+        # Priority 3: legacy positional arg (SearchIndex or str/Path)
+        if search_index_or_db is None:
+            raise ValueError("KnowledgeGraph requires conn, db_path, or search_index_or_db")
+
+        if isinstance(search_index_or_db, (str, Path)):
+            self._db_path = Path(search_index_or_db)
+            self._owns_connection = True
+        else:
+            # SearchIndex instance — use its own connection for atomic writes
+            si = search_index_or_db
+            self._db_path = si._db_path
+            self._local_conn = si._get_conn()
+            self._owns_connection = False
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get or create this KnowledgeGraph's SQLite connection."""
+        if self._local_conn is not None:
+            return self._local_conn
+        assert self._db_path is not None, "KnowledgeGraph not initialized with a db_path or conn"
+        # Import here to avoid circular import
+        from researchbot.search_index import create_sqlite_connection
+
+        self._local_conn = create_sqlite_connection(self._db_path)
+        return self._local_conn
+
+    # Backward-compat alias — external code (e.g. concept_explore.py) calls kg._conn()
+    _conn = _get_conn
+
+    def close(self) -> None:
+        """Close this KnowledgeGraph's connection if it owns it.
+
+        Safe to call multiple times. Does NOT close borrowed connections.
+        """
+        if self._owns_connection and self._local_conn is not None:
+            try:
+                self._local_conn.close()
+            except Exception:
+                pass
+            self._local_conn = None
 
     # -------------------------------------------------------------------------
     # Initialization
@@ -90,7 +157,7 @@ class KnowledgeGraph:
         Called automatically by SearchIndex.initialize() — you don't need to
         call this separately unless you only have a KnowledgeGraph instance.
         """
-        conn = self._conn()
+        conn = self._get_conn()
 
         # Concept nodes
         conn.execute("""
@@ -168,16 +235,34 @@ class KnowledgeGraph:
         """)
 
         # Indexes for fast traversal
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_citations_citing ON citation_edges(citing_paper_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_citations_cited ON citation_edges(cited_paper_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_concepts_paper ON paper_concepts(paper_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_concepts_concept ON paper_concepts(concept_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_collaborations_a1 ON author_collaborations(author_id_1)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_collaborations_a2 ON author_collaborations(author_id_2)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_citations_citing ON citation_edges(citing_paper_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_citations_cited ON citation_edges(cited_paper_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_concepts_paper ON paper_concepts(paper_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_concepts_concept ON paper_concepts(concept_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collaborations_a1 ON author_collaborations(author_id_1)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collaborations_a2 ON author_collaborations(author_id_2)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_paper_related_p1 ON paper_related(paper_id_1)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_collab_papers_a1 ON author_collaboration_papers(author_id_1)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_collab_papers_a2 ON author_collaboration_papers(author_id_2)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_collab_papers_pid ON author_collaboration_papers(paper_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collab_papers_a1 ON author_collaboration_papers(author_id_1)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collab_papers_a2 ON author_collaboration_papers(author_id_2)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collab_papers_pid ON author_collaboration_papers(paper_id)"
+        )
 
         conn.commit()
 
@@ -213,7 +298,7 @@ class KnowledgeGraph:
         if not paper_id:
             return
 
-        conn = self._conn()
+        conn = self._get_conn()
         now = datetime.now(timezone.utc).isoformat()
 
         # Citations — only replace if referenced_works key is explicitly present
@@ -429,7 +514,7 @@ class KnowledgeGraph:
         """
         if depth <= 0:
             return []
-        conn = self._conn()
+        conn = self._get_conn()
 
         if depth == 1:
             rows = conn.execute(
@@ -472,7 +557,7 @@ class KnowledgeGraph:
         """
         if depth <= 0:
             return []
-        conn = self._conn()
+        conn = self._get_conn()
 
         if depth == 1:
             rows = conn.execute(
@@ -502,15 +587,13 @@ class KnowledgeGraph:
         visited.discard(paper_id)
         return list(visited)
 
-    def get_papers_by_concept(
-        self, concept_id: str, top_k: int = 50
-    ) -> list[tuple[str, float]]:
+    def get_papers_by_concept(self, concept_id: str, top_k: int = 50) -> list[tuple[str, float]]:
         """Get paper IDs associated with a concept, ordered by score.
 
         Returns:
             List of (paper_id, score) tuples
         """
-        conn = self._conn()
+        conn = self._get_conn()
         safe_id = _safe_id(concept_id)
         rows = conn.execute(
             """
@@ -529,7 +612,7 @@ class KnowledgeGraph:
         Returns:
             List of (author_id, paper_count) tuples
         """
-        conn = self._conn()
+        conn = self._get_conn()
         rows = conn.execute(
             """
             SELECT
@@ -544,15 +627,13 @@ class KnowledgeGraph:
         ).fetchall()
         return [(r["co_author"], r["paper_count"]) for r in rows]
 
-    def get_concept_neighbors(
-        self, concept_id: str, top_k: int = 20
-    ) -> list[tuple[str, int]]:
+    def get_concept_neighbors(self, concept_id: str, top_k: int = 20) -> list[tuple[str, int]]:
         """Get other concepts that co-occur with this concept in papers.
 
         Returns:
             List of (concept_id, co_occurrence_count) tuples
         """
-        conn = self._conn()
+        conn = self._get_conn()
         safe_id = _safe_id(concept_id)
         rows = conn.execute(
             """
@@ -580,7 +661,7 @@ class KnowledgeGraph:
         """
         if depth <= 0:
             return []
-        conn = self._conn()
+        conn = self._get_conn()
         visited: set[str] = {paper_id}
         frontier: set[str] = {paper_id}
 
@@ -616,9 +697,7 @@ class KnowledgeGraph:
         visited.discard(paper_id)
         return list(visited)
 
-    def find_common_citations(
-        self, paper_ids: list[str]
-    ) -> list[tuple[str, int]]:
+    def find_common_citations(self, paper_ids: list[str]) -> list[tuple[str, int]]:
         """Find papers cited by all of the given papers (co-citation analysis).
 
         Returns:
@@ -626,7 +705,7 @@ class KnowledgeGraph:
         """
         if not paper_ids:
             return []
-        conn = self._conn()
+        conn = self._get_conn()
         placeholders = ",".join("?" * len(paper_ids))
         rows = conn.execute(
             f"""
@@ -640,9 +719,7 @@ class KnowledgeGraph:
         ).fetchall()
         return [(r["cited_paper_id"], r["cnt"]) for r in rows]
 
-    def find_path(
-        self, paper_a: str, paper_b: str, max_depth: int = 3
-    ) -> list[list[str]] | None:
+    def find_path(self, paper_a: str, paper_b: str, max_depth: int = 3) -> list[list[str]] | None:
         """Find citation paths between two papers (BFS).
 
         Returns:
@@ -652,7 +729,7 @@ class KnowledgeGraph:
         if max_depth <= 0 or paper_a == paper_b:
             return None
 
-        conn = self._conn()
+        conn = self._get_conn()
 
         # BFS from paper_a to paper_b
         if paper_a == paper_b:
@@ -678,10 +755,9 @@ class KnowledgeGraph:
                     (current,),
                 ).fetchall()
 
-                neighbors = (
-                    [r["cited_paper_id"] for r in cited_rows]
-                    + [r["citing_paper_id"] for r in citing_rows]
-                )
+                neighbors = [r["cited_paper_id"] for r in cited_rows] + [
+                    r["citing_paper_id"] for r in citing_rows
+                ]
 
                 for neighbor in neighbors:
                     if neighbor in visited:
@@ -697,7 +773,7 @@ class KnowledgeGraph:
 
     def get_paper_concepts(self, paper_id: str) -> list[str]:
         """Get all concept IDs associated with a paper."""
-        conn = self._conn()
+        conn = self._get_conn()
         rows = conn.execute(
             "SELECT concept_id FROM paper_concepts WHERE paper_id = ?",
             (paper_id,),
@@ -708,7 +784,7 @@ class KnowledgeGraph:
         """Get author IDs for all authors of a paper."""
         # Note: paper->author relationship is not explicitly stored;
         # this requires looking at the papers table's authors_json
-        conn = self._conn()
+        conn = self._get_conn()
         row = conn.execute(
             "SELECT authors_json FROM papers WHERE paper_id = ?", (paper_id,)
         ).fetchone()
@@ -749,7 +825,7 @@ class KnowledgeGraph:
         """
         if not paper_ids or min_count < 1:
             return []
-        conn = self._conn()
+        conn = self._get_conn()
         placeholders = ",".join("?" * len(paper_ids))
 
         # Get candidates with their coverage among input papers and global citation count
@@ -835,6 +911,7 @@ class KnowledgeGraph:
 
         if current_year is None:
             from datetime import datetime
+
             current_year = datetime.now().year
 
         # Get candidates
@@ -845,7 +922,7 @@ class KnowledgeGraph:
         candidate_ids = [pid for pid, _, _ in candidates]
 
         # Load metadata for all candidates in one query
-        conn = self._conn()
+        conn = self._get_conn()
         placeholders = ",".join("?" * len(candidate_ids))
 
         # Get citation_count from citation_edges (total inbound citations)
@@ -985,17 +1062,19 @@ class KnowledgeGraph:
                 for cid in concept_ids
             ]
 
-            results.append({
-                "paper_id": paper_id,
-                "title": meta.get("title", paper_id),
-                "year": meta.get("year", ""),
-                "citation_count": meta.get("citation_count", total_citations),
-                "matched_count": matched_count,
-                "matched_paper_ids": matched_list,
-                "matched_concepts": matched_concepts,
-                "score": round(score, 4),
-                "explanation": explanation,
-            })
+            results.append(
+                {
+                    "paper_id": paper_id,
+                    "title": meta.get("title", paper_id),
+                    "year": meta.get("year", ""),
+                    "citation_count": meta.get("citation_count", total_citations),
+                    "matched_count": matched_count,
+                    "matched_paper_ids": matched_list,
+                    "matched_concepts": matched_concepts,
+                    "score": round(score, 4),
+                    "explanation": explanation,
+                }
+            )
 
         # Sort by score descending
         results.sort(key=lambda x: x["score"], reverse=True)
@@ -1006,29 +1085,74 @@ class KnowledgeGraph:
     # Bulk operations
     # -------------------------------------------------------------------------
 
-    def rebuild_from_papers(self, papers: list[dict[str, Any]]) -> int:
+    def rebuild_from_papers(self, papers: list[dict[str, Any]], *, batch_size: int = 50) -> int:
         """Bulk import papers into the graph.
+
+        Transaction strategy:
+        - **Own connection** (`db_path=` or str/Path): manages its own
+          `BEGIN IMMEDIATE` → batch upserts → `COMMIT` / `ROLLBACK`.
+        - **Borrowed connection** (`conn=` or `KnowledgeGraph(search_index)`):
+          does NOT issue BEGIN/COMMIT — the caller controls the transaction.
+          This prevents "cannot start a transaction within a transaction" errors.
+
+        Args:
+            papers: List of paper dicts to import
+            batch_size: Number of papers per transaction (default 50).
+                        Only effective when using own connection.
 
         Returns:
             Number of papers successfully imported
         """
         count = 0
-        for paper in papers:
-            try:
-                self.upsert_paper(paper)
-                count += 1
-            except Exception as e:
-                logger.warning("Failed to upsert paper {} into graph: {}", paper.get("paper_id", "?"), e)
+        conn = self._get_conn()
+
+        if self._owns_connection:
+            # Own connection — manage transactions ourselves
+            for batch_start in range(0, len(papers), batch_size):
+                batch = papers[batch_start : batch_start + batch_size]
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for paper in batch:
+                        try:
+                            self.upsert_paper(paper, commit=False)
+                            count += 1
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to upsert paper {} into graph: {}",
+                                paper.get("paper_id", "?"),
+                                e,
+                            )
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    logger.warning("Batch transaction failed during rebuild_graph: {}", e)
+        else:
+            # Borrowed connection — caller controls transaction, just write
+            for paper in papers:
+                try:
+                    self.upsert_paper(paper, commit=False)
+                    count += 1
+                except Exception as e:
+                    logger.warning(
+                        "Failed to upsert paper {} into graph: {}",
+                        paper.get("paper_id", "?"),
+                        e,
+                    )
+
         return count
 
     def stats(self) -> dict[str, int]:
         """Return counts of nodes and edges in the graph."""
-        conn = self._conn()
+        conn = self._get_conn()
         return {
             "concepts": conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
             "authors": conn.execute("SELECT COUNT(*) FROM authors").fetchone()[0],
             "citation_edges": conn.execute("SELECT COUNT(*) FROM citation_edges").fetchone()[0],
-            "paper_concept_edges": conn.execute("SELECT COUNT(*) FROM paper_concepts").fetchone()[0],
-            "author_collaborations": conn.execute("SELECT COUNT(*) FROM author_collaborations").fetchone()[0],
+            "paper_concept_edges": conn.execute("SELECT COUNT(*) FROM paper_concepts").fetchone()[
+                0
+            ],
+            "author_collaborations": conn.execute(
+                "SELECT COUNT(*) FROM author_collaborations"
+            ).fetchone()[0],
             "paper_related_edges": conn.execute("SELECT COUNT(*) FROM paper_related").fetchone()[0],
         }

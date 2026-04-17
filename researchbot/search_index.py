@@ -69,6 +69,31 @@ def _build_search_text(paper: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    """Apply performance and durability PRAGMAs to a SQLite connection.
+
+    - WAL mode: allows concurrent readers while a writer is active
+    - NORMAL synchronous: balances durability with write performance
+    - busy_timeout: prevents immediate 'database is locked' errors
+    """
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
+
+
+def create_sqlite_connection(db_path: str | Path) -> sqlite3.Connection:
+    """Create a new SQLite connection with safe defaults.
+
+    Each call returns a **fresh** connection — do NOT share across components.
+    """
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    _apply_sqlite_pragmas(conn)
+    return conn
+
+
 class SearchIndex:
     """SQLite-based local semantic search index.
 
@@ -108,15 +133,13 @@ class SearchIndex:
         return self._sqlite_vec_available
 
     def get_graph(self) -> KnowledgeGraph:
-        """Get the KnowledgeGraph instance sharing this SearchIndex's connection."""
-        return KnowledgeGraph(self)
+        """Get the KnowledgeGraph instance using its own connection to the same DB file."""
+        return KnowledgeGraph(self._db_path)
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get or create the SQLite connection."""
         if self._conn is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self._db_path))
-            self._conn.row_factory = sqlite3.Row
+            self._conn = create_sqlite_connection(self._db_path)
         return self._conn
 
     async def initialize(self) -> None:
@@ -220,6 +243,7 @@ class SearchIndex:
                 # Get path to vec0.dll from sqlite-vec package
                 try:
                     import sqlite_vec as _sv
+
                     vec0_dll = os.path.join(os.path.dirname(_sv.__file__), "vec0.dll")
                 except Exception:
                     vec0_dll = "vec0.dll"  # Fallback to searching PATH
@@ -234,7 +258,9 @@ class SearchIndex:
                         else:
                             conn.execute(f"SELECT load_extension('{vec0_dll}')")
                         loaded = True
-                        logger.info("sqlite-vec loaded with entry point: {}", entry_point or "default")
+                        logger.info(
+                            "sqlite-vec loaded with entry point: {}", entry_point or "default"
+                        )
                         break
                     except Exception:
                         continue
@@ -317,7 +343,7 @@ class SearchIndex:
         conn.commit()
 
         # Initialize knowledge graph tables
-        kg = KnowledgeGraph(self)
+        kg = KnowledgeGraph(self._db_path)
         kg.initialize()
         self._graph_initialized = True
 
@@ -330,7 +356,7 @@ class SearchIndex:
         if getattr(self, "_graph_initialized", False):
             return
         conn = self._get_conn()
-        kg = KnowledgeGraph(self)
+        kg = KnowledgeGraph(self._db_path)
         kg.initialize()
         self._graph_initialized = True
 
@@ -368,7 +394,11 @@ class SearchIndex:
         """
         paper_id = paper.get("paper_id")
         if not paper_id:
-            return {"content_changed": False, "graph_sync_status": "skipped", "graph_sync_error": "no paper_id"}
+            return {
+                "content_changed": False,
+                "graph_sync_status": "skipped",
+                "graph_sync_error": "no paper_id",
+            }
 
         conn = self._get_conn()
 
@@ -387,7 +417,9 @@ class SearchIndex:
         has_authors = "authors" in paper
         if has_authors:
             authors = paper["authors"]
-            authors_json = json.dumps(authors if isinstance(authors, list) else [], ensure_ascii=False)
+            authors_json = json.dumps(
+                authors if isinstance(authors, list) else [], ensure_ascii=False
+            )
         else:
             authors_json = existing_row["authors_json"] if existing_row else "[]"
 
@@ -403,7 +435,9 @@ class SearchIndex:
         has_categories = "categories" in paper
         if has_categories:
             categories = paper["categories"]
-            categories_json = json.dumps(categories if isinstance(categories, list) else [], ensure_ascii=False)
+            categories_json = json.dumps(
+                categories if isinstance(categories, list) else [], ensure_ascii=False
+            )
         else:
             categories_json = existing_row["categories_json"] if existing_row else "[]"
 
@@ -443,7 +477,9 @@ class SearchIndex:
         has_keywords = "keywords" in paper
         if has_keywords:
             keywords = paper["keywords"]
-            keywords_json = json.dumps(keywords if isinstance(keywords, list) else [], ensure_ascii=False)
+            keywords_json = json.dumps(
+                keywords if isinstance(keywords, list) else [], ensure_ascii=False
+            )
         else:
             keywords_json = existing_row["keywords_json"] if existing_row else "[]"
 
@@ -556,8 +592,8 @@ class SearchIndex:
                 crossref_id,
                 content_hash,
                 now,
-                "ok",       # graph_sync_status
-                "",         # graph_sync_error
+                "ok",  # graph_sync_status
+                "",  # graph_sync_error
             ),
         )
 
@@ -566,7 +602,9 @@ class SearchIndex:
         # the actual stored state, not the partial input.
         if content_changed:
             # Rebuild FTS entry — uses effective_paper for search text
-            self._rebuild_fts_entry(conn, paper_id, effective_paper, summary_json, topic, tags_json, eff_summary)
+            self._rebuild_fts_entry(
+                conn, paper_id, effective_paper, summary_json, topic, tags_json, eff_summary
+            )
 
             # Generate and store embedding using effective_paper
             if self._sqlite_vec_available and self.embedding_client.is_enabled():
@@ -574,24 +612,20 @@ class SearchIndex:
             elif self._sqlite_vec_available and not self.embedding_client.is_enabled():
                 # Embedding was previously available but now unavailable
                 # Remove stale embeddings
-                conn.execute(
-                    "DELETE FROM paper_embeddings WHERE paper_id = ?", (paper_id,)
-                )
+                conn.execute("DELETE FROM paper_embeddings WHERE paper_id = ?", (paper_id,))
                 if self._sqlite_vec_available:
                     try:
-                        conn.execute(
-                            "DELETE FROM paper_vectors WHERE paper_id = ?", (paper_id,)
-                        )
+                        conn.execute("DELETE FROM paper_vectors WHERE paper_id = ?", (paper_id,))
                     except Exception:
                         pass
 
-        # Sync to knowledge graph — uses the original partial paper dict
-        # so that missing graph-edge fields correctly trigger "preserve" semantics.
+        # Sync to knowledge graph — uses the SearchIndex's own connection
+        # so paper + graph writes are in the same transaction.
         graph_sync_status = "ok"
         graph_sync_error = ""
         try:
             self._ensure_graph_initialized()
-            kg = KnowledgeGraph(self)
+            kg = KnowledgeGraph(conn=conn)
             kg.upsert_paper(paper, commit=False)
         except Exception as e:
             logger.warning(f"Failed to sync paper {paper_id} to knowledge graph: {e}")
@@ -611,7 +645,9 @@ class SearchIndex:
             "graph_sync_error": graph_sync_error,
         }
 
-    def _compute_method_content_hash(self, method_name: str, description: str, module_interface: str) -> str:
+    def _compute_method_content_hash(
+        self, method_name: str, description: str, module_interface: str
+    ) -> str:
         """Compute a hash of method content that determines when to re-index."""
         parts = [method_name, description, module_interface]
         return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
@@ -651,8 +687,17 @@ class SearchIndex:
                 extracted_at=excluded.extracted_at,
                 content_hash=excluded.content_hash
             """,
-            (id_, paper_id, method_name, task_type, description,
-             module_interface, dependencies, extracted_at, content_hash),
+            (
+                id_,
+                paper_id,
+                method_name,
+                task_type,
+                description,
+                module_interface,
+                dependencies,
+                extracted_at,
+                content_hash,
+            ),
         )
         conn.commit()
 
@@ -703,14 +748,20 @@ class SearchIndex:
             except Exception:
                 summary = {}
 
-        summary_text = " ".join([
-            summary.get("one_sentence", ""),
-            summary.get("problem", ""),
-            summary.get("method", ""),
-            summary.get("findings", ""),
-        ])
+        summary_text = " ".join(
+            [
+                summary.get("one_sentence", ""),
+                summary.get("problem", ""),
+                summary.get("method", ""),
+                summary.get("findings", ""),
+            ]
+        )
         keywords = ",".join(paper.get("keywords", []))
-        topic_tags = topic + " " + ",".join(json.loads(tags_json) if isinstance(tags_json, str) else tags_json)
+        topic_tags = (
+            topic
+            + " "
+            + ",".join(json.loads(tags_json) if isinstance(tags_json, str) else tags_json)
+        )
 
         # Delete old FTS entry by paper_id
         conn.execute("DELETE FROM papers_fts WHERE paper_id = ?", (paper_id,))
@@ -718,8 +769,14 @@ class SearchIndex:
         # Insert new FTS entry directly
         conn.execute(
             "INSERT INTO papers_fts(paper_id, title, abstract, summary, keywords, topic_tags) VALUES (?, ?, ?, ?, ?, ?)",
-            (paper_id, paper.get("title", ""), paper.get("abstract", ""),
-             summary_text, keywords, topic_tags),
+            (
+                paper_id,
+                paper.get("title", ""),
+                paper.get("abstract", ""),
+                summary_text,
+                keywords,
+                topic_tags,
+            ),
         )
 
     async def _upsert_embedding(
@@ -844,7 +901,9 @@ class SearchIndex:
                     r["lexical_score"] = 0.0
                     r["vector_score"] = r.pop("score", 0)
                     r["matched_filters"] = self._get_matched_filters(conn, r["paper_id"])
-                    if self._apply_filters(r, topic, tags, year, year_from, year_to, categories, source):
+                    if self._apply_filters(
+                        r, topic, tags, year, year_from, year_to, categories, source
+                    ):
                         results.append(r)
 
         # 3. RRF fusion
@@ -858,8 +917,9 @@ class SearchIndex:
             vec_score = r.get("vector_score", 0)
 
             # RRF fusion
-            rrf = (0.0 if lex_rank == 0 else 1.0 / (k + lex_rank)) * self._config.lexical_weight + \
-                  (0.0 if vec_rank == 0 else 1.0 / (k + vec_rank)) * self._config.vector_weight
+            rrf = (0.0 if lex_rank == 0 else 1.0 / (k + lex_rank)) * self._config.lexical_weight + (
+                0.0 if vec_rank == 0 else 1.0 / (k + vec_rank)
+            ) * self._config.vector_weight
 
             # Also add raw scores
             rrf += lex_score * self._config.lexical_weight + vec_score * self._config.vector_weight
@@ -1023,7 +1083,10 @@ Only output the JSON array, nothing else."""
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # Try to use dashscope or configured provider
-                api_base = self._config.embedding_api_base or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                api_base = (
+                    self._config.embedding_api_base
+                    or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                )
 
                 payload = {
                     "model": "qwen-plus",
@@ -1071,13 +1134,11 @@ Only output the JSON array, nothing else."""
 
         return None
 
-    def _get_matched_filters(
-        self, conn: sqlite3.Connection, paper_id: str
-    ) -> dict[str, Any]:
+    def _get_matched_filters(self, conn: sqlite3.Connection, paper_id: str) -> dict[str, Any]:
         """Get which filters matched for a paper."""
         row = conn.execute(
             "SELECT topic, tags_json, year, categories_json, source FROM papers WHERE paper_id = ?",
-            (paper_id,)
+            (paper_id,),
         ).fetchone()
 
         if not row:
@@ -1152,9 +1213,7 @@ Only output the JSON array, nothing else."""
     def get_paper(self, paper_id: str) -> dict[str, Any] | None:
         """Get a paper by ID."""
         conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM papers WHERE paper_id = ?", (paper_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
 
         if not row:
             return None
@@ -1223,21 +1282,27 @@ Only output the JSON array, nothing else."""
             for row in rows:
                 results.append(self._row_to_method(dict(row)))
         elif task_type:
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT * FROM methods
                 WHERE task_type = ?
                 ORDER BY extracted_at DESC
                 LIMIT ?
-            """, [task_type, top_k]).fetchall()
+            """,
+                [task_type, top_k],
+            ).fetchall()
             for row in rows:
                 results.append(self._row_to_method(dict(row)))
         else:
             # No filters - return recent methods
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT * FROM methods
                 ORDER BY extracted_at DESC
                 LIMIT ?
-            """, [top_k]).fetchall()
+            """,
+                [top_k],
+            ).fetchall()
             for row in rows:
                 results.append(self._row_to_method(dict(row)))
 
@@ -1259,13 +1324,16 @@ Only output the JSON array, nothing else."""
             if vector is not None:
                 try:
                     embedding_blob = vector_to_bytes(vector)
-                    vec_rows = conn.execute("""
+                    vec_rows = conn.execute(
+                        """
                         SELECT id, distance
                         FROM method_vectors
                         WHERE embedding MATCH ?
                         ORDER BY distance
                         LIMIT ?
-                    """, [embedding_blob, top_k * 2]).fetchall()
+                    """,
+                        [embedding_blob, top_k * 2],
+                    ).fetchall()
 
                     if vec_rows:
                         vec_ids = [str(row["id"]) for row in vec_rows]
@@ -1305,8 +1373,7 @@ Only output the JSON array, nothing else."""
         """
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT * FROM methods WHERE paper_id = ? ORDER BY extracted_at DESC",
-            (paper_id,)
+            "SELECT * FROM methods WHERE paper_id = ? ORDER BY extracted_at DESC", (paper_id,)
         ).fetchall()
         return [self._row_to_method(dict(row)) for row in rows]
 
@@ -1407,8 +1474,11 @@ async def rebuild_graph_from_workspace(
     await search_index.initialize()
     kg = search_index.get_graph()
 
-    result["count"] = kg.rebuild_from_papers(papers)
-    result["stats"] = kg.stats()
-    search_index.close()
+    try:
+        result["count"] = kg.rebuild_from_papers(papers)
+        result["stats"] = kg.stats()
+    finally:
+        kg.close()
+        search_index.close()
 
     return result
