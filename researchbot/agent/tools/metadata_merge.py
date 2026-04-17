@@ -148,9 +148,30 @@ def normalize_from_openalex(work: Any) -> dict[str, Any]:
     return paper
 
 
+def normalize_from_semantic_scholar(work: Any) -> dict[str, Any]:
+    """Convert SemanticScholarWork to standardized paper dict."""
+    paper = create_standard_paper()
+    paper["paper_id"] = work.paper_id
+    paper["source"] = "semantic_scholar"
+    paper["external_ids"]["doi"] = work.doi
+    paper["external_ids"]["semantic_scholar"] = work.paper_id
+    if work.arxiv_id:
+        paper["external_ids"]["arxiv"] = work.arxiv_id
+    paper["title"] = work.title
+    paper["authors"] = list(work.authors) if work.authors else []
+    paper["year"] = str(work.year) if work.year else ""
+    paper["venue"] = work.venue or ""
+    paper["publication_type"] = "journal_article"
+    paper["abstract"] = work.abstract
+    paper["citation_count"] = work.citation_count
+    paper["provenance"]["sources"] = ["semantic_scholar"]
+    return paper
+
+
 # --------------------------------------------------------------------
 # Merge Rules
 # --------------------------------------------------------------------
+
 
 def merge_papers(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
     """Merge secondary metadata into primary paper dict.
@@ -256,9 +277,11 @@ def merge_papers(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str
 # Score-based ranking for multi-source results
 # --------------------------------------------------------------------
 
+
 @dataclass
 class ScoredPaper:
     """A paper with a relevance score."""
+
     paper: dict[str, Any]
     score: float = 0.0
     match_type: str = ""  # "doi", "title_exact", "title_fuzzy", "author", "year"
@@ -372,7 +395,9 @@ def merge_and_rank(
         return []
 
     # Score all candidates
-    scored = [score_paper(p, target_doi, target_title, target_authors, target_year) for p in candidates]
+    scored = [
+        score_paper(p, target_doi, target_title, target_authors, target_year) for p in candidates
+    ]
 
     # Sort by score descending
     scored.sort(key=lambda x: x.score, reverse=True)

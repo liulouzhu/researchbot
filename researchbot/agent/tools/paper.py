@@ -22,7 +22,20 @@ from researchbot.agent.tools.arxiv_client import (
 from researchbot.agent.tools.crossref_client import search_crossref
 from researchbot.agent.tools.openalex_client import search_openalex
 from researchbot.agent.tools.semantic_scholar_client import search_semantic_scholar
-from researchbot.config.schema import MethodExtractionConfig, SemanticScholarConfig, SemanticSearchConfig
+from researchbot.agent.tools.paper_identity import (
+    MergeTier,
+    build_canonical_key,
+    classify_match,
+    merge_paper_fields,
+    normalize_arxiv_id,
+    normalize_doi,
+    papers_likely_same,
+)
+from researchbot.config.schema import (
+    MethodExtractionConfig,
+    SemanticScholarConfig,
+    SemanticSearchConfig,
+)
 from researchbot.search_index import SearchIndex
 from researchbot.utils.helpers import compute_short_id, extract_json_array
 
@@ -82,7 +95,9 @@ class PaperSearchTool(Tool):
     """Search arXiv for academic papers by topic."""
 
     name = "paper_search"
-    description = "Search arXiv for academic papers by topic. Returns title, authors, abstract, and links."
+    description = (
+        "Search arXiv for academic papers by topic. Returns title, authors, abstract, and links."
+    )
 
     parameters = {
         "type": "object",
@@ -132,7 +147,12 @@ class PaperSearchTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, proxy: str | None = None, mailto: str | None = None, semantic_scholar_api_key: str | None = None):
+    def __init__(
+        self,
+        proxy: str | None = None,
+        mailto: str | None = None,
+        semantic_scholar_api_key: str | None = None,
+    ):
         self.proxy = proxy
         self._mailto = mailto
         self._semantic_scholar_api_key = semantic_scholar_api_key
@@ -176,7 +196,7 @@ class PaperSearchTool(Tool):
         crossref_task = search_crossref(
             query=query,
             max_results=max_per_source,
-            mailto=getattr(self, '_mailto', None),
+            mailto=getattr(self, "_mailto", None),
         )
         openalex_task = search_openalex(
             query=query,
@@ -185,13 +205,12 @@ class PaperSearchTool(Tool):
         semantic_scholar_task = search_semantic_scholar(
             query=query,
             max_results=max_per_source,
-            api_key=getattr(self, '_semantic_scholar_api_key', None),
+            api_key=getattr(self, "_semantic_scholar_api_key", None),
         )
 
         # 等待所有搜索完成，捕获异常
         results = await asyncio.gather(
-            arxiv_task, crossref_task, openalex_task, semantic_scholar_task,
-            return_exceptions=True
+            arxiv_task, crossref_task, openalex_task, semantic_scholar_task, return_exceptions=True
         )
 
         arxiv_results = results[0] if not isinstance(results[0], Exception) else []
@@ -214,7 +233,10 @@ class PaperSearchTool(Tool):
         openalex_results: list,
         semantic_scholar_results: list = [],
     ) -> list[dict]:
-        """Aggregate results from all sources with DOI deduplication.
+        """Aggregate results from all sources with canonical identity dedup.
+
+        Uses canonical key (DOI > arXiv ID > title+author+year > title+year)
+        for stable cross-source deduplication and field merging.
 
         Returns a list of aggregated paper records:
         {
@@ -227,127 +249,315 @@ class PaperSearchTool(Tool):
             "arxiv_id": str | None,
             "sources": list[str],
             "combined_score": float,
+            "external_ids": dict,
+            "abstract": str,
+            "url": str,
+            "pdf_url": str,
         }
         """
-        papers: dict[str, dict] = {}
-        doi_to_arxiv_key: dict[str, str] = {}  # Track DOI -> arXiv key for merging
+        # Collect all source records into a flat list of dicts
+        all_records: list[dict] = []
 
-        # Process arXiv results
+        # arXiv records
         for entry in arxiv_results:
-            key = f"arxiv:{entry.paper_id}"
-            papers[key] = {
-                "title": entry.title,
-                "authors": entry.authors,
-                "year": int(entry.published[:4]) if entry.published else None,
-                "venue": None,
-                "citations": None,
-                "doi": entry.doi,
-                "arxiv_id": entry.paper_id,
-                "sources": ["arxiv"],
-                "combined_score": 1.0,
-            }
-            # Track DOI for cross-reference
-            if entry.doi:
-                doi_to_arxiv_key[entry.doi] = key
+            all_records.append(
+                {
+                    "title": entry.title,
+                    "authors": entry.authors,
+                    "year": int(entry.published[:4]) if entry.published else None,
+                    "venue": None,
+                    "citations": None,
+                    "doi": entry.doi,
+                    "arxiv_id": entry.paper_id,
+                    "sources": ["arxiv"],
+                    "combined_score": 1.0,
+                    "external_ids": {
+                        "arxiv": normalize_arxiv_id(entry.paper_id),
+                        "doi": normalize_doi(entry.doi) if entry.doi else "",
+                    },
+                    "abstract": entry.summary,
+                    "url": entry.abs_url,
+                    "pdf_url": entry.pdf_url,
+                }
+            )
 
-        # Process Crossref results
+        # Crossref records
         for work in crossref_results:
             doi = work.doi
             if not doi:
                 continue
-            key = f"doi:{doi}"
-            # Check if we have an arXiv entry with this DOI
-            arxiv_key = doi_to_arxiv_key.get(doi)
-            if arxiv_key:
-                papers[arxiv_key]["citations"] = max(papers[arxiv_key]["citations"] or 0, work.cited_by_count or 0)
-                papers[arxiv_key]["sources"].append("crossref")
-                if work.journal:
-                    papers[arxiv_key]["venue"] = work.journal
-            elif key in papers:
-                papers[key]["citations"] = max(papers[key]["citations"] or 0, work.cited_by_count or 0)
-                papers[key]["sources"].append("crossref")
-                if work.journal:
-                    papers[key]["venue"] = work.journal
-            else:
-                papers[key] = {
+            all_records.append(
+                {
                     "title": work.title,
-                    "authors": work.authors,  # list[str]
+                    "authors": work.authors,
                     "year": int(work.year) if work.year else None,
-                    "venue": work.journal,
+                    "venue": work.journal or None,
                     "citations": work.cited_by_count,
                     "doi": doi,
                     "arxiv_id": None,
                     "sources": ["crossref"],
                     "combined_score": 1.0,
+                    "external_ids": {
+                        "doi": normalize_doi(doi),
+                    },
+                    "abstract": work.abstract,
+                    "url": work.url or f"https://doi.org/{doi}",
+                    "pdf_url": "",
                 }
+            )
 
-        # Process OpenAlex results
+        # OpenAlex records
         for work in openalex_results:
             doi = work.doi
             if not doi:
                 continue
-            key = f"doi:{doi}"
-            # Check if we have an arXiv entry with this DOI
-            arxiv_key = doi_to_arxiv_key.get(doi)
-            if arxiv_key:
-                papers[arxiv_key]["citations"] = max(papers[arxiv_key]["citations"] or 0, work.cited_by_count or 0)
-                papers[arxiv_key]["sources"].append("openalex")
-                if work.journal:
-                    papers[arxiv_key]["venue"] = papers[arxiv_key]["venue"] or work.journal
-            elif key in papers:
-                papers[key]["citations"] = max(papers[key]["citations"] or 0, work.cited_by_count or 0)
-                papers[key]["sources"].append("openalex")
-                if work.journal:
-                    papers[key]["venue"] = papers[key]["venue"] or work.journal
-            else:
-                papers[key] = {
+            all_records.append(
+                {
                     "title": work.title,
                     "authors": work.authors,
                     "year": int(work.year) if work.year else None,
-                    "venue": work.journal,
+                    "venue": work.journal or None,
                     "citations": work.cited_by_count,
                     "doi": doi,
                     "arxiv_id": None,
                     "sources": ["openalex"],
                     "combined_score": 1.0,
+                    "external_ids": {
+                        "doi": normalize_doi(doi),
+                        "openalex": work.id,
+                    },
+                    "abstract": work.abstract,
+                    "url": work.url,
+                    "pdf_url": "",
                 }
+            )
 
-        # Process Semantic Scholar results
+        # Semantic Scholar records
         for work in semantic_scholar_results:
             doi = work.doi
-            # Check if we have an arXiv entry with this DOI
-            arxiv_key = doi_to_arxiv_key.get(doi) if doi else None
-            if arxiv_key:
-                papers[arxiv_key]["citations"] = max(papers[arxiv_key]["citations"] or 0, work.citation_count or 0)
-                papers[arxiv_key]["sources"].append("semantic_scholar")
-                if work.venue:
-                    papers[arxiv_key]["venue"] = papers[arxiv_key]["venue"] or work.venue
-                # Also add arXiv ID if available
-                if work.arxiv_id and not papers[arxiv_key]["arxiv_id"]:
-                    papers[arxiv_key]["arxiv_id"] = work.arxiv_id
-            elif doi and f"doi:{doi}" in papers:
-                papers[f"doi:{doi}"]["citations"] = max(papers[f"doi:{doi}"]["citations"] or 0, work.citation_count or 0)
-                papers[f"doi:{doi}"]["sources"].append("semantic_scholar")
-                if work.venue:
-                    papers[f"doi:{doi}"]["venue"] = papers[f"doi:{doi}"]["venue"] or work.venue
-            else:
-                # Use Semantic Scholar paper ID as key
-                key = f"s2:{work.paper_id}"
-                papers[key] = {
+            all_records.append(
+                {
                     "title": work.title,
                     "authors": work.authors,
                     "year": work.year,
-                    "venue": work.venue,
+                    "venue": work.venue or None,
                     "citations": work.citation_count,
                     "doi": doi,
                     "arxiv_id": work.arxiv_id,
                     "sources": ["semantic_scholar"],
                     "combined_score": 1.0,
+                    "external_ids": {
+                        "semantic_scholar": work.paper_id,
+                        **({"doi": normalize_doi(doi)} if doi else {}),
+                        **({"arxiv": normalize_arxiv_id(work.arxiv_id)} if work.arxiv_id else {}),
+                    },
+                    "abstract": work.abstract,
+                    "url": "",
+                    "pdf_url": "",
                 }
+            )
 
-        # Sort by combined score
-        result = list(papers.values())
-        result.sort(key=lambda x: x["combined_score"], reverse=True)
+        # Group by canonical key and merge
+        return self._merge_by_canonical_key(all_records)
+
+    def _merge_by_canonical_key(self, records: list[dict]) -> list[dict]:
+        """Group paper records by canonical key and merge each group.
+
+        Strategy:
+        1. Build canonical key for each record.
+        2. Group records sharing the same canonical key.
+        3. Within each group, merge fields using merge_paper_fields.
+        4. For DOI/arXiv groups: high-confidence merge (exact tier).
+        5. For title_author_year / title_year groups: validate with
+           classify_match; only merge on exact/strong tier.
+        6. Record merge_confidence and merge_reason on merged records.
+        7. Sort by combined_score descending.
+        """
+        if not records:
+            return []
+
+        # Phase 1: Group by canonical key
+        key_groups: dict[str, list[dict]] = {}
+        for rec in records:
+            key_type, key_val = build_canonical_key(rec)
+            group_key = key_val
+            if group_key not in key_groups:
+                key_groups[group_key] = []
+            key_groups[group_key].append(rec)
+
+        # Phase 2: Merge within each group
+        merged_papers: list[dict] = []
+        for group_key, group_records in key_groups.items():
+            if len(group_records) == 1:
+                # No merge needed, but ensure canonical key fields are populated
+                paper = dict(group_records[0])
+                # Ensure doi and arxiv_id are normalized in the output
+                if paper.get("doi"):
+                    paper["doi"] = normalize_doi(paper["doi"])
+                if paper.get("arxiv_id"):
+                    paper["arxiv_id"] = normalize_arxiv_id(paper["arxiv_id"])
+                merged_papers.append(paper)
+                continue
+
+            # Determine key type for confidence level
+            key_type = group_key.split(":")[0] if ":" in group_key else ""
+
+            if key_type in ("doi", "arxiv"):
+                # DOI or arXiv key — exact match, high confidence
+                merged = group_records[0]
+                for rec in group_records[1:]:
+                    merged = merge_paper_fields(
+                        merged,
+                        rec,
+                        merge_tier=MergeTier.exact,
+                        merge_reason=f"Same {key_type} key: {group_key}",
+                    )
+                # Normalize output fields
+                if merged.get("doi"):
+                    merged["doi"] = normalize_doi(merged["doi"])
+                if merged.get("arxiv_id"):
+                    merged["arxiv_id"] = normalize_arxiv_id(merged["arxiv_id"])
+                merged_papers.append(merged)
+            elif key_type in ("tay", "ty"):
+                # Heuristic key — validate pairwise, only merge on exact/strong tier
+                validated_group: list[dict] = [group_records[0]]
+                for rec in group_records[1:]:
+                    merged_into = None
+                    for i, v in enumerate(validated_group):
+                        tier, reason = classify_match(rec, v)
+                        if tier in (MergeTier.exact, MergeTier.strong):
+                            validated_group[i] = merge_paper_fields(
+                                v,
+                                rec,
+                                merge_tier=tier,
+                                merge_reason=reason,
+                            )
+                            merged_into = i
+                            break
+                    if merged_into is None:
+                        # Different paper or only weak match — keep separate
+                        validated_group.append(rec)
+                # Add all validated records (some may still be separate)
+                for paper in validated_group:
+                    if paper.get("doi"):
+                        paper["doi"] = normalize_doi(paper["doi"])
+                    if paper.get("arxiv_id"):
+                        paper["arxiv_id"] = normalize_arxiv_id(paper["arxiv_id"])
+                merged_papers.extend(validated_group)
+            else:
+                # Unknown key type — keep separate to be safe
+                merged_papers.extend(group_records)
+
+        # Phase 3: Cross-group merging
+        # Only exact and strong matches are allowed in union-find.
+        # Weak matches are NOT merged automatically.
+        merged_papers = self._cross_group_merge(merged_papers)
+
+        # Phase 4: Sort by combined_score
+        merged_papers.sort(key=lambda x: x.get("combined_score", 1.0), reverse=True)
+        return merged_papers
+
+    def _cross_group_merge(self, papers: list[dict]) -> list[dict]:
+        """Second-pass merge: detect and merge records across different
+        canonical key groups that are actually the same paper.
+
+        Safety constraints (prevent chain merging of weakly-related papers):
+        - Only exact and strong match tiers are allowed in union-find.
+        - Weak matches are NEVER merged automatically.
+        - At least one side must have a DOI or arXiv ID for strong matches.
+        - No transitive closure through weak links.
+        """
+        if len(papers) <= 1:
+            return papers
+
+        # Build a union-find structure
+        parent = list(range(len(papers)))
+        # Track the tier at which each union was made (to prevent
+        # chain-merging: a group can only grow through same-tier or
+        # higher-tier unions)
+        union_tier = [MergeTier.exact] * len(papers)
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int, tier: MergeTier) -> None:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+                # Record the lowest tier in this group
+                _tier_order = {MergeTier.exact: 3, MergeTier.strong: 2, MergeTier.weak: 1}
+                if _tier_order.get(tier.value, 0) < _tier_order.get(union_tier[ri], 0):
+                    union_tier[ri] = tier
+
+        # Compare all pairs
+        for i in range(len(papers)):
+            for j in range(i + 1, len(papers)):
+                a = papers[i]
+                b = papers[j]
+                tier, reason = classify_match(a, b)
+
+                # Only exact and strong matches are eligible for union-find
+                if tier not in (MergeTier.exact, MergeTier.strong):
+                    continue
+
+                # Additional safety: strong matches require at least one
+                # side to have a DOI or arXiv ID (no pure heuristic unions)
+                if tier == MergeTier.strong:
+                    a_doi = normalize_doi(
+                        a.get("doi", "") or (a.get("external_ids") or {}).get("doi", "")
+                    )
+                    b_doi = normalize_doi(
+                        b.get("doi", "") or (b.get("external_ids") or {}).get("doi", "")
+                    )
+                    a_arxiv = normalize_arxiv_id(
+                        a.get("arxiv_id", "") or (a.get("external_ids") or {}).get("arxiv", "")
+                    )
+                    b_arxiv = normalize_arxiv_id(
+                        b.get("arxiv_id", "") or (b.get("external_ids") or {}).get("arxiv", "")
+                    )
+                    has_strong_id = bool(a_doi or b_doi or a_arxiv or b_arxiv)
+                    if not has_strong_id:
+                        # Strong heuristic match but no ID anchor — don't union
+                        continue
+
+                union(i, j, tier)
+
+        # Group by root and merge
+        groups: dict[int, list[int]] = {}
+        for i in range(len(papers)):
+            root = find(i)
+            if root not in groups:
+                groups[root] = []
+            groups[root].append(i)
+
+        result: list[dict] = []
+        for root, indices in groups.items():
+            if len(indices) == 1:
+                result.append(papers[indices[0]])
+            else:
+                # Determine the merge tier for this group
+                group_tier = union_tier[root]
+                # Build a reason string from the first pair
+                first_tier, first_reason = classify_match(papers[indices[0]], papers[indices[1]])
+                merged = papers[indices[0]]
+                for idx in indices[1:]:
+                    tier, reason = classify_match(merged, papers[idx])
+                    merged = merge_paper_fields(
+                        merged,
+                        papers[idx],
+                        merge_tier=group_tier,
+                        merge_reason=reason,
+                    )
+                # Normalize output fields
+                if merged.get("doi"):
+                    merged["doi"] = normalize_doi(merged["doi"])
+                if merged.get("arxiv_id"):
+                    merged["arxiv_id"] = normalize_arxiv_id(merged["arxiv_id"])
+                result.append(merged)
+
         return result
 
     def _format_aggregated_results(self, aggregated: list[dict], query: str) -> str:
@@ -364,21 +574,26 @@ class PaperSearchTool(Tool):
             if len(paper["authors"]) > 3:
                 authors_str += " et al."
             year_str = str(paper["year"]) if paper["year"] else "N/A"
-            venue_str = paper["venue"] or ("arXiv" if "arxiv" in paper["sources"] else "N/A")
+            venue_str = paper["venue"] or (
+                "arXiv" if "arxiv" in paper.get("sources", []) else "N/A"
+            )
             lines.append(f"    {authors_str} | {year_str} | {venue_str}")
 
             # 引用数和来源
             citation_parts = []
-            if paper["citations"]:
+            if paper.get("citations"):
                 citation_parts.append(f"Citations: {paper['citations']}")
             arxiv_id = paper.get("arxiv_id")
             if arxiv_id:
                 citation_parts.append(f"arXiv: {arxiv_id}")
+            doi = paper.get("doi")
+            if doi:
+                citation_parts.append(f"DOI: {doi}")
             if citation_parts:
                 lines.append(f"    {' | '.join(citation_parts)}")
 
             # 来源标记
-            sources_str = ", ".join(paper["sources"])
+            sources_str = ", ".join(paper.get("sources", []))
             lines.append(f"    Sources: {sources_str}")
             lines.append("")
 
@@ -619,16 +834,20 @@ class PaperSaveTool(Tool):
         for m in methods:
             if isinstance(m, dict) and m.get("method_name"):
                 method_id = compute_short_id(f"{paper_id}:{m['method_name']}")
-                validated.append({
-                    "id": method_id,
-                    "paper_id": paper_id,
-                    "method_name": m.get("method_name", ""),
-                    "task_type": m.get("task_type", "other"),
-                    "description": m.get("description", ""),
-                    "module_interface": m.get("module_interface", ""),
-                    "dependencies": m.get("dependencies", []) if isinstance(m.get("dependencies"), list) else [],
-                    "extracted_at": now,
-                })
+                validated.append(
+                    {
+                        "id": method_id,
+                        "paper_id": paper_id,
+                        "method_name": m.get("method_name", ""),
+                        "task_type": m.get("task_type", "other"),
+                        "description": m.get("description", ""),
+                        "module_interface": m.get("module_interface", ""),
+                        "dependencies": m.get("dependencies", [])
+                        if isinstance(m.get("dependencies"), list)
+                        else [],
+                        "extracted_at": now,
+                    }
+                )
         return validated
 
     async def execute(
@@ -679,7 +898,9 @@ class PaperSaveTool(Tool):
         index_path = indexes_dir / "papers.json"
         index = self._load_index(index_path)
         papers_list = index.get("papers", [])
-        existing_idx = next((i for i, p in enumerate(papers_list) if p.get("paper_id") == paper_id), -1)
+        existing_idx = next(
+            (i for i, p in enumerate(papers_list) if p.get("paper_id") == paper_id), -1
+        )
         if existing_idx >= 0:
             papers_list[existing_idx] = paper_record
         else:
@@ -697,28 +918,30 @@ class PaperSaveTool(Tool):
                 index_status = f"ok (content_changed={sync_result['content_changed']})"
                 if sync_result["graph_sync_status"] == "failed":
                     index_status = f"graph sync failed: {sync_result['graph_sync_error']}"
-                    logger.warning(f"Graph sync failed for {paper_id}: {sync_result['graph_sync_error']}")
+                    logger.warning(
+                        f"Graph sync failed for {paper_id}: {sync_result['graph_sync_error']}"
+                    )
             except Exception as e:
                 index_status = f"error: {e}"
                 logger.warning(f"Search index update failed for {paper_id}: {e}")
 
         # Auto-extract methods if configured
         if search_index is not None:
-            config = getattr(self, '_config', None)
+            config = getattr(self, "_config", None)
             method_extraction_config: MethodExtractionConfig | None = None
             if config is not None:
-                method_extraction_config = getattr(config.literature, 'method_extraction', None)
+                method_extraction_config = getattr(config.literature, "method_extraction", None)
             if method_extraction_config and method_extraction_config.auto_extract:
-                    try:
-                        title = paper_record.get("title", "")
-                        abstract = paper_record.get("abstract", "")
-                        methods = await self._quick_extract_methods(paper_id, title, abstract)
-                        for method in methods:
-                            await search_index.upsert_method_with_vector(method)
-                        if methods:
-                            logger.info(f"Extracted {len(methods)} methods from {paper_id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to extract methods for {paper_id}: {e}")
+                try:
+                    title = paper_record.get("title", "")
+                    abstract = paper_record.get("abstract", "")
+                    methods = await self._quick_extract_methods(paper_id, title, abstract)
+                    for method in methods:
+                        await search_index.upsert_method_with_vector(method)
+                    if methods:
+                        logger.info(f"Extracted {len(methods)} methods from {paper_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to extract methods for {paper_id}: {e}")
 
         # Close search index after all operations
         if search_index is not None:
@@ -766,35 +989,37 @@ class PaperSaveTool(Tool):
         if extracted_path:
             lines.append(f"- **Extracted Text**: {extracted_path}")
 
-        lines.extend([
-            "",
-            "## Abstract",
-            "",
-            paper.get('abstract', 'N/A'),
-            "",
-            "## Structured Summary",
-            source_label,
-            "",
-            "**One Sentence**: " + summary.get("one_sentence", ""),
-            "",
-            "**Problem**: " + summary.get("problem", ""),
-            "",
-            "**Method**: " + summary.get("method", ""),
-            "",
-            "**Findings**: " + summary.get("findings", ""),
-            "",
-            "**Limitations**: " + summary.get("limitations", ""),
-            "",
-            "**Keywords**: " + ", ".join(summary.get("keywords", [])),
-            "",
-            "**Topic Tags**: " + ", ".join(summary.get("topic_tags", [])),
-            "",
-            "## Notes",
-            "",
-            "*Add your notes here*",
-            "",
-            f"---\n*Saved at: {paper.get('saved_at', datetime.now(timezone.utc).isoformat())}*",
-        ])
+        lines.extend(
+            [
+                "",
+                "## Abstract",
+                "",
+                paper.get("abstract", "N/A"),
+                "",
+                "## Structured Summary",
+                source_label,
+                "",
+                "**One Sentence**: " + summary.get("one_sentence", ""),
+                "",
+                "**Problem**: " + summary.get("problem", ""),
+                "",
+                "**Method**: " + summary.get("method", ""),
+                "",
+                "**Findings**: " + summary.get("findings", ""),
+                "",
+                "**Limitations**: " + summary.get("limitations", ""),
+                "",
+                "**Keywords**: " + ", ".join(summary.get("keywords", [])),
+                "",
+                "**Topic Tags**: " + ", ".join(summary.get("topic_tags", [])),
+                "",
+                "## Notes",
+                "",
+                "*Add your notes here*",
+                "",
+                f"---\n*Saved at: {paper.get('saved_at', datetime.now(timezone.utc).isoformat())}*",
+            ]
+        )
         return "\n".join(lines)
 
     def _update_readme(self, readme_path: Path, paper: dict[str, Any]) -> None:
@@ -1009,7 +1234,9 @@ class PaperSummarizeTool(Tool):
 
         return str(json_path)
 
-    def _update_md_summary(self, md_path: Path, summary: dict[str, Any], paper: dict[str, Any]) -> str:
+    def _update_md_summary(
+        self, md_path: Path, summary: dict[str, Any], paper: dict[str, Any]
+    ) -> str:
         """Update markdown file with structured summary."""
         with open(md_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -1040,7 +1267,9 @@ class PaperSummarizeTool(Tool):
                 new_lines.append("**Limitations**: ")
                 new_lines.append(summary.get("limitations", "") + "\n\n")
                 new_lines.append("**Keywords**: " + ", ".join(summary.get("keywords", [])) + "\n")
-                new_lines.append("**Topic Tags**: " + ", ".join(summary.get("topic_tags", [])) + "\n")
+                new_lines.append(
+                    "**Topic Tags**: " + ", ".join(summary.get("topic_tags", [])) + "\n"
+                )
 
                 j = i + 1
                 while j < len(lines) and not lines[j].startswith("## Notes"):
@@ -1263,6 +1492,7 @@ class PaperSummarizeTool(Tool):
                 # No extracted text yet — try auto-fetch via OA / Unpaywall
                 try:
                     from researchbot.agent.tools.fulltext import ensure_full_text
+
                     await ensure_full_text(
                         resolved_paper,
                         workspace=self._workspace,
@@ -1279,7 +1509,11 @@ class PaperSummarizeTool(Tool):
 
         existing_summary = resolved_paper.get("summary", {})
         if isinstance(existing_summary, dict):
-            if existing_summary.get("one_sentence") and existing_summary.get("problem") and not overwrite:
+            if (
+                existing_summary.get("one_sentence")
+                and existing_summary.get("problem")
+                and not overwrite
+            ):
                 summary = existing_summary
                 summary["text_source"] = "existing"
             else:
@@ -1452,6 +1686,7 @@ class PaperDownloadPdfTool(Tool):
 
         # Use unified full-text fetching
         from researchbot.agent.tools.fulltext import ensure_full_text
+
         result = await ensure_full_text(
             paper_dict,
             workspace=self._workspace,
@@ -1550,7 +1785,7 @@ class PaperExtractTextTool(Tool):
             for i, page in enumerate(reader.pages):
                 text = page.extract_text()
                 if text:
-                    text_parts.append(f"[Page {i+1}]\n{text}")
+                    text_parts.append(f"[Page {i + 1}]\n{text}")
             return "\n\n".join(text_parts)
         except Exception as e:
             return f"Error extracting text: {e}"
@@ -1740,9 +1975,10 @@ Please provide a structured literature review in JSON format:
 def _slugify(text: str) -> str:
     """Create a URL-safe slug from text."""
     import re
+
     text = text.lower().strip()
-    text = re.sub(r'[^\w\s-]', '', text)
-    text = re.sub(r'[-\s]+', '-', text)
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[-\s]+", "-", text)
     return text[:60]
 
 
@@ -1844,6 +2080,7 @@ class PaperCompareTool(Tool):
         if search_index is not None:
             try:
                 import asyncio
+
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
                     # If we're already in an async context, we can't use await here
@@ -1930,22 +2167,31 @@ class PaperCompareTool(Tool):
                 problem = method = findings = limitations = ""
                 keywords = topic_tags = []
 
-            abstract = p.get("abstract", p.get("summary", {}).get("problem", "") if isinstance(p.get("summary"), dict) else "")
+            abstract = p.get(
+                "abstract",
+                p.get("summary", {}).get("problem", "")
+                if isinstance(p.get("summary"), dict)
+                else "",
+            )
 
-            papers_info.append({
-                "paper_id": paper_id,
-                "title": title,
-                "year": year,
-                "authors": p.get("authors", [])[:3],
-                "abstract": (abstract[:500] + "...") if abstract and len(abstract) > 500 else abstract,
-                "problem": problem,
-                "method": method,
-                "findings": findings,
-                "limitations": limitations,
-                "keywords": keywords,
-                "topic_tags": topic_tags,
-                "categories": p.get("categories", []),
-            })
+            papers_info.append(
+                {
+                    "paper_id": paper_id,
+                    "title": title,
+                    "year": year,
+                    "authors": p.get("authors", [])[:3],
+                    "abstract": (abstract[:500] + "...")
+                    if abstract and len(abstract) > 500
+                    else abstract,
+                    "problem": problem,
+                    "method": method,
+                    "findings": findings,
+                    "limitations": limitations,
+                    "keywords": keywords,
+                    "topic_tags": topic_tags,
+                    "categories": p.get("categories", []),
+                }
+            )
         return json.dumps(papers_info, ensure_ascii=False, indent=2)
 
     async def _call_llm(self, prompt: str) -> dict[str, Any]:
@@ -2030,7 +2276,9 @@ class PaperCompareTool(Tool):
         if result.get("papers"):
             output_parts.append("\n## Papers Compared")
             for p in result["papers"]:
-                output_parts.append(f"- **{p.get('paper_id', '?')}**: {p.get('title', '?')} ({p.get('year', '?')}) - {p.get('key_takeaway', '')}")
+                output_parts.append(
+                    f"- **{p.get('paper_id', '?')}**: {p.get('title', '?')} ({p.get('year', '?')}) - {p.get('key_takeaway', '')}"
+                )
 
         if result.get("comparison_dimensions"):
             dims = result["comparison_dimensions"]
@@ -2159,6 +2407,7 @@ class PaperReviewTool(Tool):
         if search_index is not None:
             try:
                 import asyncio
+
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
                     # If we're already in an async context, we can't use await here
@@ -2247,23 +2496,29 @@ class PaperReviewTool(Tool):
 
             abstract = p.get("abstract", "")
 
-            papers_info.append({
-                "paper_id": paper_id,
-                "title": title,
-                "year": year,
-                "authors": p.get("authors", [])[:5],
-                "abstract": (abstract[:800] + "...") if abstract and len(abstract) > 800 else abstract,
-                "problem": problem,
-                "method": method,
-                "findings": findings,
-                "limitations": limitations,
-                "keywords": keywords,
-                "topic_tags": topic_tags,
-                "categories": p.get("categories", []),
-            })
+            papers_info.append(
+                {
+                    "paper_id": paper_id,
+                    "title": title,
+                    "year": year,
+                    "authors": p.get("authors", [])[:5],
+                    "abstract": (abstract[:800] + "...")
+                    if abstract and len(abstract) > 800
+                    else abstract,
+                    "problem": problem,
+                    "method": method,
+                    "findings": findings,
+                    "limitations": limitations,
+                    "keywords": keywords,
+                    "topic_tags": topic_tags,
+                    "categories": p.get("categories", []),
+                }
+            )
         return json.dumps(papers_info, ensure_ascii=False, indent=2)
 
-    def _save_review(self, topic: str, review_data: dict[str, Any], papers: list[dict[str, Any]]) -> tuple[str, str]:
+    def _save_review(
+        self, topic: str, review_data: dict[str, Any], papers: list[dict[str, Any]]
+    ) -> tuple[str, str]:
         """Save review to JSON and MD files."""
         if not self._workspace:
             return "", ""
@@ -2277,8 +2532,7 @@ class PaperReviewTool(Tool):
         review_data["topic_slug"] = slug
         review_data["review_generated_at"] = datetime.now(timezone.utc).isoformat()
         review_data["papers_used"] = [
-            {"paper_id": p.get("paper_id"), "title": p.get("title")}
-            for p in papers
+            {"paper_id": p.get("paper_id"), "title": p.get("title")} for p in papers
         ]
 
         # Save JSON
@@ -2292,7 +2546,9 @@ class PaperReviewTool(Tool):
 
         return str(json_path), str(md_path)
 
-    def _generate_md(self, md_path: Path, topic: str, review: dict[str, Any], papers: list[dict[str, Any]]) -> None:
+    def _generate_md(
+        self, md_path: Path, topic: str, review: dict[str, Any], papers: list[dict[str, Any]]
+    ) -> None:
         """Generate markdown version of the review."""
         lines = [
             f"# Literature Review: {topic}\n",
@@ -2390,7 +2646,7 @@ class PaperReviewTool(Tool):
             authors_str = ", ".join(authors[:5]) if authors else "Unknown"
             if len(authors) > 5:
                 authors_str += " et al."
-            lines.append(f"- [{pid}] {authors_str}. \"{title}\". {year}.\n")
+            lines.append(f'- [{pid}] {authors_str}. "{title}". {year}.\n')
 
         with open(md_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
@@ -2481,9 +2737,13 @@ class PaperReviewTool(Tool):
         if result.get("synthesis"):
             synth = result["synthesis"]
             if synth.get("common_findings"):
-                output_parts.append(f"\n**Common Findings** ({len(synth['common_findings'])} items)")
+                output_parts.append(
+                    f"\n**Common Findings** ({len(synth['common_findings'])} items)"
+                )
             if synth.get("research_gaps"):
-                output_parts.append(f"\n**Research Gaps** identified: {len(result['research_gaps'])}")
+                output_parts.append(
+                    f"\n**Research Gaps** identified: {len(result['research_gaps'])}"
+                )
 
         if result.get("conclusion"):
             output_parts.append(f"\n## Conclusion\n{result['conclusion'][:300]}...\n")
